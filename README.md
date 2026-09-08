@@ -51,7 +51,13 @@ near-mock scenario my_flow.json
 
 ## Determinism controls
 
-```bash
+```
+
+Big contracts are pulled with cursor pagination (consistent to one pinned
+block, shown in the summary). If your RPC caps contract-state reads and the
+snapshot aborts with `TOO_LARGE_CONTRACT_STATE`, point it at a full-cap
+provider: `--rpc https://rpc.intea.rs` (wrap.near-sized tries pull fine).
+bash
 NEAR_MOCK_SEED=abc123          # pin random_seed
 NEAR_MOCK_NOW=1700000000       # pin block timestamp (--advance to time-travel)
 NEAR_MOCK_EPOCH=500            # pin epoch_height
