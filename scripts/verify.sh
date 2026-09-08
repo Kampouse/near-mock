@@ -140,6 +140,30 @@ check "help lists snapshot" "near-mock snapshot" "$out"
 out=$($NM state 2>&1)
 check "state import usage" "state import" "$out"
 
+echo "== CLI contract: exit codes / dump JSON / round-trip =="
+# #1: contract failure => nonzero exit (the CI pattern: near-mock ... || exit 1)
+$NM "$WASM" sign '{}' --state "$WORK/ex1.bin" >/dev/null 2>&1
+[ $? -ne 0 ] && ok "trap exits nonzero" || bad "trap exit 0"
+$NM "$WASM" sign '{"message":"x"}' --prepaid 0.0001 --state "$WORK/ex2.bin" >/dev/null 2>&1
+[ $? -ne 0 ] && ok "out-of-gas exits nonzero" || bad "out-of-gas exit 0"
+$NM "$WASM" sign '{"message":"ok"}' --state "$WORK/ex3.bin" >/dev/null 2>&1
+[ $? -eq 0 ] && ok "successful call exits 0" || bad "successful call nonzero"
+# #2: dump stdout is pure JSON; summary on stderr
+$NM state dump "$WORK/ex3.bin" 2>"$WORK/dump.err" | jq -e . >/dev/null 2>&1 \
+  && ok "dump stdout parses as JSON" || bad "dump stdout not JSON"
+grep -q "keys" "$WORK/dump.err" && ok "dump summary on stderr" || bad "dump summary not on stderr"
+# #3: dump | import round-trip (both shapes)
+$NM state dump "$WORK/ex3.bin" 2>/dev/null | $NM state import "$WORK/ex4.bin" - >/dev/null 2>&1 \
+  && ok "dump|import round-trip (canonical)" || bad "round-trip canonical"
+printf '[{"account":"rt.test.near","key":"a2V5","value":"dg=="}]' > "$WORK/legacy.json"
+$NM state import "$WORK/ex5.bin" "$WORK/legacy.json" >/dev/null 2>&1 \
+  && ok "legacy flat-row import accepted" || bad "legacy import rejected"
+# #4: missing contract names the file + the convention
+mkdir -p "$WORK/empty" && printf '{"steps":[{"method":"get"}]}' > "$WORK/empty/s.json"
+out=$(cd "$WORK/empty" && $NM scenario s.json 2>&1)
+check "missing wasm names file" "cannot read contract \`contract.wasm\`" "$out"
+check "missing wasm names manifest escape" "override with" "$out"
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 [ $fail -eq 0 ]

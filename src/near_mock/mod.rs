@@ -210,6 +210,13 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let encoded = bincode::serialize(&st.storage)?;
         std::fs::write(state_path, encoded)?;
     }
+    // CI contract: a failed tx exits nonzero (traps/out-of-gas/failed
+    // receipts must never look green). Orphan receipt failures do NOT
+    // flip the code: like real NEAR, they are visible in the outcome
+    // but don't fail the transaction.
+    if !outcome.ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -1115,7 +1122,11 @@ pub(crate) fn init_sandbox(
         let (acct, path) = pair
             .split_once('=')
             .ok_or("manifest entries must be acct=/path")?;
-        let bytes = std::fs::read(path)?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            format!(
+                "cannot read contract `{path}`: {e} (scenario default expects contract.wasm beside the scenario file; override with \"manifest\")"
+            )
+        })?;
         eprintln!("📦 {} → {}", acct, path);
         modules.insert(
             acct.to_string(),
@@ -2053,7 +2064,7 @@ fn run_snapshot(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: near-mock state import <state.bin> <dump.json> [--replace-acct]\n       near-mock state dump <state.bin> [account-prefix]";
+    let usage = "usage: near-mock state import <state.bin> <dump.json|- > [--replace-acct]\n       near-mock state dump <state.bin> [account-prefix]  (stdout = JSON, summary on stderr)\n\nformat (both accepted): {\"account\":A,\"values\":[{\"key\":<b64>,\"value\":<b64>},...]}\n                       or flat rows [{\"account\":A,\"key\":<b64>,\"value\":<b64>},...]\n`state dump | state import - ` round-trips.";
     let sub = args.get(2).map(|s| s.as_str()).ok_or(usage)?;
     let replace_acct = args.iter().any(|a| a == "--replace-acct");
 
@@ -2079,64 +2090,89 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 std::fs::read(dump_path)?
             };
             let dump: serde_json::Value = serde_json::from_slice(&raw)?;
-            let account = dump
-                .get("account")
-                .and_then(|a| a.as_str())
-                .ok_or("dump missing \"account\"")?
-                .to_string();
-            let arr = dump
-                .get("values")
-                .and_then(|v| v.as_array())
-                .ok_or("dump missing \"values\" array")?;
-
-            // parse every entry BEFORE touching the state file (atomic-ish:
-            // a malformed dump never half-applies)
-            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(arr.len());
-            for (i, v) in arr.iter().enumerate() {
+            // Two accepted shapes (round-trips with `state dump`):
+            //   canonical: {"account": A, "values":[{"key": <b64>, "value": <b64>}, ...]}
+            //   legacy flat rows (also accepted, incl. "value_b64" alias):
+            //              [{"account": A, "key": <b64>, "value": <b64>}, ...]
+            fn row_kv(v: &serde_json::Value, i: usize) -> Result<(String, String), String> {
                 let k = v
                     .get("key")
                     .and_then(|x| x.as_str())
                     .ok_or_else(|| format!("values[{i}] missing key"))?;
                 let val = v
                     .get("value")
+                    .or_else(|| v.get("value_b64"))
                     .and_then(|x| x.as_str())
                     .ok_or_else(|| format!("values[{i}] missing value"))?;
-                entries.push((b64(k)?, b64(val)?));
+                Ok((k.to_string(), val.to_string()))
+            }
+            // account -> entries, filled from whichever shape we got
+            let mut per_account: std::collections::BTreeMap<String, Vec<(String, String)>> =
+                Default::default();
+            if let Some(arr) = dump.get("values").and_then(|v| v.as_array()) {
+                let account = dump
+                    .get("account")
+                    .and_then(|a| a.as_str())
+                    .ok_or("dump has \"values\" but missing \"account\"")?
+                    .to_string();
+                let e: Result<Vec<_>, String> =
+                    arr.iter().enumerate().map(|(i, v)| row_kv(v, i)).collect();
+                per_account.insert(account, e?);
+            } else if let Some(rows) = dump.as_array() {
+                for (i, v) in rows.iter().enumerate() {
+                    let acct = v
+                        .get("account")
+                        .and_then(|a| a.as_str())
+                        .ok_or_else(|| format!("rows[{i}] missing \"account\""))?
+                        .to_string();
+                    let (k, val) = row_kv(v, i)?;
+                    per_account.entry(acct).or_default().push((k, val));
+                }
+            } else {
+                return Err("unrecognized dump format: expected {\"account\",\"values\":[...]} or [{\"account\",\"key\",\"value\"},...]".into());
             }
 
-            // load or start fresh state
             let mut map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
                 match std::fs::read(state_path) {
-                    Ok(d) => bincode::deserialize(&d)
-                        .map_err(|e| format!("{}: not a near-mock state file ({e})", state_path))?,
-                    Err(_) => Default::default(),
+                    Ok(data) => bincode::deserialize(&data).map_err(|e| {
+                        format!("{}: not a near-mock state file ({e})", state_path)
+                    })?,
+                    Err(_) => Default::default(), // new file: seed from scratch
                 };
 
-            let pre = prefixed_key(&account, b"");
-            let before = map.len();
-            if replace_acct {
-                let stale: Vec<Vec<u8>> = map
-                    .keys()
-                    .filter(|k| k.len() > pre.len() && k.starts_with(&pre))
-                    .cloned()
+            let total: usize = per_account.values().map(|v| v.len()).sum();
+            for (account, kvs) in &per_account {
+                // decode this partition's entries BEFORE any write
+                // (atomic-ish: a malformed dump never half-applies)
+                let entries: Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error>> = kvs
+                    .iter()
+                    .map(|(k, v)| Ok((b64(k)?, b64(v)?)))
                     .collect();
-                for k in stale {
-                    map.remove(&k);
+                let entries = entries?;
+                let pre = prefixed_key(account, b"");
+                if replace_acct {
+                    let stale: Vec<Vec<u8>> = map
+                        .keys()
+                        .filter(|k| k.len() > pre.len() && k.starts_with(&pre))
+                        .cloned()
+                        .collect();
+                    for k in stale {
+                        map.remove(&k);
+                    }
+                }
+                for (k, v) in entries {
+                    map.insert(prefixed_key(account, &k), v);
                 }
             }
-            for (k, v) in entries {
-                map.insert(prefixed_key(&account, &k), v);
-            }
-            let _ = before; // informational only
 
             std::fs::write(state_path, bincode::serialize(&map)?)?;
             println!(
-                "📥 imported {} keys for {} → {}{}",
-                arr.len(),
-                account,
+                "📥 imported {} keys across {} account(s) → {}{}",
+                total,
+                per_account.len(),
                 state_path,
                 if replace_acct {
-                    " (partition replaced)"
+                    " (partition(s) replaced)"
                 } else {
                     ""
                 }
@@ -2152,10 +2188,15 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     state_path, e
                 )
             })?;
-            let map: std::collections::HashMap<Vec<u8>, Vec<u8>> = bincode::deserialize(&data)
-                .map_err(|e| format!("{}: not a near-mock state file ({e})", state_path))?;
+            let map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                bincode::deserialize(&data)
+                    .map_err(|e| format!("{}: not a near-mock state file ({e})", state_path))?;
 
             use base64::Engine;
+            // stdout is PURE JSON (pipe into jq / `state import`). Human
+            // summary goes to stderr. Keys/values are base64 so binary
+            // state survives the trip — this exact shape is accepted back
+            // by `state import` (dump | import round-trips).
             let mut rows: Vec<(String, String, String)> = map
                 .iter()
                 .filter_map(|(k, v)| {
@@ -2167,27 +2208,25 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             return None;
                         }
                     }
-                    let key = String::from_utf8(k[sep + 1..].to_vec())
-                        .unwrap_or_else(|_| "<binary>".to_string());
-                    Some((
-                        acct,
-                        key,
-                        base64::engine::general_purpose::STANDARD.encode(v),
-                    ))
+                    let key_b64 = base64::engine::general_purpose::STANDARD.encode(&k[sep + 1..]);
+                    let val_b64 = base64::engine::general_purpose::STANDARD.encode(v);
+                    Some((acct, key_b64, val_b64))
                 })
                 .collect();
             rows.sort();
 
-            println!("[");
-            for (i, (acct, key, v)) in rows.iter().enumerate() {
-                let comma = if i + 1 < rows.len() { "," } else { "" };
-                println!(
-                    "  {{\"account\": \"{}\", \"key\": \"{}\", \"value_b64\": \"{}\"}}{}",
-                    acct, key, v, comma
-                );
-            }
-            println!("]");
-            println!(
+            let arr: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(acct, key_b64, val_b64)| {
+                    serde_json::json!({
+                        "account": acct,
+                        "key": key_b64,
+                        "value": val_b64,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+            eprintln!(
                 "— {} keys{}",
                 rows.len(),
                 prefix
@@ -2233,8 +2272,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "                                  predecessor/now/advance/gas/attach/expect/...)"
         );
-        println!("  near-mock state import <state.bin> <dump.json>");
-        println!("  near-mock state dump <state.bin>");
+        println!("  near-mock state import <state.bin> <dump.json|- > [--replace-acct]");
+        println!("  near-mock state dump <state.bin> [account-prefix]  (stdout = JSON)");
         println!("  near-mock snapshot <account> <state.bin>  (pull live wasm+state via RPC)");
         println!();
         println!("ARGS:");
@@ -2807,6 +2846,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("💾 Saved {} keys", st.storage.len());
     }
 
+    // Same CI contract as call/cross: trap/out-of-gas => exit 1.
+    if run_outcome != "ok" {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
