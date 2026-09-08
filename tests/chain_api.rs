@@ -116,7 +116,12 @@ fn attached_deposit_commits_and_refunds() {
 
 #[test]
 fn state_persists_and_reloads() {
-    let path = format!("/tmp/nm_chain_test_{}.bin", std::process::id());
+    // temp_dir, not a hardcoded /tmp: sandboxed macOS (Seatbelt) and some
+    // CI runners deny /tmp writes while $TMPDIR is writable.
+    let path = std::env::temp_dir()
+        .join(format!("nm_chain_test_{}.bin", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     let _ = std::fs::remove_file(&path);
 
     {

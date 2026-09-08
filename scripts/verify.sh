@@ -7,7 +7,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 FIX="$DIR/../fixtures"
 WASM="$FIX/guestbook.wasm"
 NM="$DIR/../target/release/near-mock"
-WORK=$(mktemp -d /tmp/nmverify.XXXXXX)
+# portable workdir: $TMPDIR when set (sandboxed macOS / CI deny /tmp), /tmp otherwise
+WORK="${TMPDIR:-/tmp}/nmverify.$$"
+mkdir -p "$WORK"
 pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL: $1"; }
@@ -168,6 +170,27 @@ out=$($NM "$WASM" get_signatures --view --state "$WORK/c5a.bin" 2>&1)
 if printf '%s' "$out" | grep -q "deserialize input"; then bad "single-call C5: flag fed as args"; else ok "single-call C5: omitted args-json defaults to {}"; fi
 out=$($NM cross "$WORK/c5b.bin" "gb=$WASM" gb.test.near get_signatures --view 2>&1)
 if printf '%s' "$out" | grep -q "deserialize input"; then bad "cross C5: flag fed as args"; else ok "cross C5: omitted args-json defaults to {}"; fi
+
+# --version / -V: version string from Cargo.toml, exit 0
+out=$($NM --version 2>&1); rc=$?
+check "--version prints pkg version" "near-mock 0\." "$out"
+[ $rc -eq 0 ] && ok "--version exit 0" || bad "--version exit $rc"
+out=$($NM -V 2>&1)
+check "-V alias works" "near-mock 0\." "$out"
+
+# storage namespace: single-call state lands under the DOCUMENTED default
+# account (help: "NEAR_MOCK_CONTRACT default escrow.test.near"), matching
+# what current_account_id() reports — not the "" partition (dump showed
+# account:"", the escrow prefix filter returned 0 rows, and cross/scenario
+# couldn't see single-call state).
+$NM "$WASM" sign '{"message":"ns interop"}' --state "$WORK/ns.bin" >/dev/null 2>&1
+out=$($NM state dump "$WORK/ns.bin" 2>/dev/null)
+check "single-call state under escrow.test.near" '"account": "escrow.test.near"' "$out"
+out=$($NM state dump "$WORK/ns.bin" escrow.test.near 2>/dev/null | jq -e 'length == 1' >/dev/null 2>&1 && echo FILTEROK)
+check "dump prefix filter finds default account" "FILTEROK" "$out"
+# interop: cross under the same account reads single-call state
+out=$($NM cross "$WORK/ns.bin" "escrow.test.near=$WASM" escrow.test.near get_signature_count 2>/dev/null)
+check "cross reads single-call state (same account)" "📄 1" "$out"
 
 echo
 echo "RESULT: $pass passed, $fail failed"

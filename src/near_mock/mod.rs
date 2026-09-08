@@ -2154,9 +2154,8 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
                 match std::fs::read(state_path) {
-                    Ok(data) => bincode::deserialize(&data).map_err(|e| {
-                        format!("{}: not a near-mock state file ({e})", state_path)
-                    })?,
+                    Ok(data) => bincode::deserialize(&data)
+                        .map_err(|e| format!("{}: not a near-mock state file ({e})", state_path))?,
                     Err(_) => Default::default(), // new file: seed from scratch
                 };
 
@@ -2164,10 +2163,8 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             for (account, kvs) in &per_account {
                 // decode this partition's entries BEFORE any write
                 // (atomic-ish: a malformed dump never half-applies)
-                let entries: Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error>> = kvs
-                    .iter()
-                    .map(|(k, v)| Ok((b64(k)?, b64(v)?)))
-                    .collect();
+                let entries: Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error>> =
+                    kvs.iter().map(|(k, v)| Ok((b64(k)?, b64(v)?))).collect();
                 let entries = entries?;
                 let pre = prefixed_key(account, b"");
                 if replace_acct {
@@ -2208,9 +2205,8 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     state_path, e
                 )
             })?;
-            let map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-                bincode::deserialize(&data)
-                    .map_err(|e| format!("{}: not a near-mock state file ({e})", state_path))?;
+            let map: std::collections::HashMap<Vec<u8>, Vec<u8>> = bincode::deserialize(&data)
+                .map_err(|e| format!("{}: not a near-mock state file ({e})", state_path))?;
 
             use base64::Engine;
             // stdout is PURE JSON (pipe into jq / `state import`). Human
@@ -2330,6 +2326,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", GasSchedule::default().to_json());
     }
 
+    if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
+        // cli convention: --version wins even alongside other flags; the
+        // version comes from Cargo.toml so releases can't drift from it
+        println!("near-mock {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
         print_main_usage();
         return Ok(()); // exit 0 — scripts probe this for availability
@@ -2549,11 +2551,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every fire-and-forget payout executed invisibly (the G-14 "dead
     // arms" were never dead). Same env the cross driver sets.
     //
-    // contract stays EMPTY unless NEAR_MOCK_CONTRACT is set: hosts treat
-    // empty as the "escrow.test.near" fixture default (current_account_id,
-    // sig messages, storage prefixes all derive from it) — passing the
-    // wasm file path here broke all 54 auth vectors before the sig-check
-    // ordering even ran.
+    // contract defaults to the DOCUMENTED account (help: "NEAR_MOCK_CONTRACT
+    // default escrow.test.near") — never the wasm path (that broke all 54
+    // auth vectors: sig messages embedded the path). Identity output is
+    // byte-identical to the old empty-string + host-fallback behavior
+    // (current_account_id already mapped "" → escrow.test.near); the only
+    // change is the STORAGE partition: single-call state now lands under
+    // escrow.test.near like cross/scenario/snapshot state always did, so
+    // dump shows real accounts, the dump prefix filter works, and
+    // single-call state is visible to cross/scenario runs of the same
+    // account. Old ""-partitioned state files are not migrated.
+    let contract_acct =
+        std::env::var("NEAR_MOCK_CONTRACT").unwrap_or_else(|_| "escrow.test.near".into());
     ENGINE_TLS.with(|e| *e.borrow_mut() = Some(Rc::new(engine.clone())));
     STATE_ARC.with(|s| *s.borrow_mut() = Some(state.clone()));
     // signer default = the legacy exec_ctx_or_default value so tests that
@@ -2565,7 +2574,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             input: args_bytes.clone(),
             signer: signer.clone(),
             predecessor: signer.clone(),
-            contract: std::env::var("NEAR_MOCK_CONTRACT").unwrap_or_default(),
+            contract: contract_acct,
             view: run_view,
         })
     });
