@@ -5,6 +5,9 @@ edition = "2021"
 description = "Local NEAR contract runner — real contracts, real hosts, deterministic, no node"
 license = "MIT"
 repository = "https://github.com/Kampouse/near-mock"
+readme = "README.md"
+keywords = ["near", "blockchain", "testing", "wasm", "sandbox"]
+categories = ["development-tools::testing"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
