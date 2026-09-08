@@ -117,4 +117,4 @@ seeded, not beacon-derived.
 ## Status
 
 Battle-tested against Burrow margin flows (cross-contract, callbacks, batch
-actions) with live-mainnet snapshots. 52-check hermetic verify suite.
+actions) with live-mainnet snapshots. 68-check hermetic verify suite.
