@@ -320,6 +320,7 @@ impl CallBuilder {
             &self.signer,
             self.attach,
             &self.fail_receipts,
+            self.view,
         );
         if self.view != saved_view {
             mock_state_view_set(&state, saved_view);

@@ -165,7 +165,11 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = &pos[1];
     let contract_acct = &pos[2];
     let method = &pos[3];
-    let args_json = pos.get(4).cloned().unwrap_or_else(|| "{}".into());
+    let args_json = pos
+        .get(4)
+        .filter(|s| !s.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| "{}".into());
     let run_view = pos.iter().any(|a| a == "--view");
 
     let mut fuel_cfg = Config::new();
@@ -198,6 +202,7 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &signer,
         attach,
         &fail_receipts,
+        run_view,
     )?;
     print_outcome(&outcome);
 
@@ -277,17 +282,32 @@ pub(crate) fn execute_tx(
     signer: &str,
     attach: u128,
     fail_receipts: &[usize],
+    view: bool,
 ) -> Result<TxOutcome, Box<dyn std::error::Error>> {
     // Always set (not only when non-empty): a previous call on this thread
     // must not leak its forced-failure receipt indices into this one.
     fail_receipts_set(fail_receipts);
+    // Fresh-tx hygiene (issue #1 L1): a previous call on this thread must not
+    // leak return_data, registers, or promise state into this one. Receipt
+    // execution clears+restores around sub-calls; the entry call relied on
+    // fresh processes (CLI) or per-step resets (scenario runner) — the
+    // MockChain library path had neither, so call #2 saw call #1's data.
+    {
+        let mut st = state.lock().unwrap();
+        st.return_data = None;
+        st.registers.clear();
+    }
+    PROMISE_DAG.with(|d| d.borrow_mut().clear());
+    EXECUTED_PROMISES.with(|e| e.borrow_mut().clear());
+    PROMISE_RESULTS.with(|r| *r.borrow_mut() = Vec::new());
+    PENDING_RETURN.with(|p| *p.borrow_mut() = None);
     EXEC_CTX.with(|c| {
         *c.borrow_mut() = Some(ExecCtx {
             input: args_json.as_bytes().to_vec(),
             signer: signer.to_string(),
             predecessor: signer.to_string(),
             contract: contract_acct.to_string(),
-            view: false,
+            view,
         })
     });
 
@@ -2393,7 +2413,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }),
         other => other
-            .cloned()
+            .map(|s| s.as_str())
+            .filter(|s| !s.starts_with('-'))
+            .map(|s| s.to_string())
             .unwrap_or_else(|| "{}".to_string())
             .into_bytes(),
     };

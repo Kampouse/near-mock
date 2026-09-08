@@ -45,10 +45,13 @@ fn tx_then_view_roundtrip() {
 
     let list = chain.view(GB, "get_signatures").fire().expect("fire");
     assert!(list.ok);
-    assert_eq!(
+    // Regression (issue #1 L1): this view previously returned "1" — stale
+    // data leaked from the get_signature_count call above, because
+    // execute_tx never cleared return_data between library calls.
+    assert_ne!(
         list.return_string().as_deref(),
         Some("1"),
-        "fixture's get_signatures returns the count"
+        "get_signatures must not replay the previous call's return"
     );
     // Ground truth: the STATE blob records the message + signer.
     let state_blob = chain.storage_get(GB, b"STATE").expect("STATE key");
@@ -159,4 +162,56 @@ fn deterministic_reruns_match_byte_for_byte() {
     let a = run();
     let b = run();
     assert_eq!(a, b, "same inputs → identical outcome, gas, and output");
+}
+
+const SCEN: &str = "scen.test.near";
+
+fn scen_chain() -> MockChain {
+    MockChain::builder()
+        .contract(SCEN, "fixtures/scen.wasm")
+        .expect("fixture wasm")
+        .signer("alice.test.near")
+        .now(1_788_000_000)
+        .build()
+        .expect("build chain")
+}
+
+#[test]
+fn no_stale_return_data_between_calls() {
+    // Issue #1 L1: every call after the first returned the FIRST call's data.
+    let chain = scen_chain();
+    let v1 = chain.view(SCEN, "whoami").fire().expect("fire");
+    assert!(v1.ok, "whoami failed: {:?}", v1.error);
+    let first = v1.return_string();
+
+    let v2 = chain.view(SCEN, "clock").fire().expect("fire");
+    assert!(v2.ok, "clock failed: {:?}", v2.error);
+    assert_ne!(
+        v2.return_string(),
+        first,
+        "second view returned the first view's data (stale return_data leak)"
+    );
+}
+
+#[test]
+fn view_rejects_writes() {
+    // Issue #1 L2: view() did not enforce read-only on the library path.
+    let chain = scen_chain();
+    let before = chain.storage_len();
+    let v = chain.view(SCEN, "gate").fire().expect("fire");
+    assert!(
+        !v.ok,
+        "a write inside a view must fail; got ok with data {:?}",
+        v.return_string()
+    );
+    assert_eq!(
+        chain.storage_len(),
+        before,
+        "view must not change storage count"
+    );
+    // And the write must not have leaked the 'breach' key in.
+    assert!(
+        chain.storage_get(SCEN, b"breach").is_none(),
+        "view committed the write anyway"
+    );
 }

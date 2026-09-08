@@ -163,6 +163,11 @@ mkdir -p "$WORK/empty" && printf '{"steps":[{"method":"get"}]}' > "$WORK/empty/s
 out=$(cd "$WORK/empty" && $NM scenario s.json 2>&1)
 check "missing wasm names file" "cannot read contract \`contract.wasm\`" "$out"
 check "missing wasm names manifest escape" "override with" "$out"
+# C5: omitted args-json must default to {}, not feed the first flag to the contract
+out=$($NM "$WASM" get_signatures --view --state "$WORK/c5a.bin" 2>&1)
+if printf '%s' "$out" | grep -q "deserialize input"; then bad "single-call C5: flag fed as args"; else ok "single-call C5: omitted args-json defaults to {}"; fi
+out=$($NM cross "$WORK/c5b.bin" "gb=$WASM" gb.test.near get_signatures --view 2>&1)
+if printf '%s' "$out" | grep -q "deserialize input"; then bad "cross C5: flag fed as args"; else ok "cross C5: omitted args-json defaults to {}"; fi
 
 echo
 echo "RESULT: $pass passed, $fail failed"
