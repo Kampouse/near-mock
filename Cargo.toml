@@ -1,0 +1,32 @@
+[package]
+name = "near-mock"
+version = "0.1.0"
+edition = "2021"
+description = "Local NEAR contract runner — real contracts, real hosts, deterministic, no node"
+license = "MIT"
+repository = "https://github.com/Kampouse/near-mock"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+base64 = "0.22"
+wasmtime = { version = "45", features = ["cranelift"] }
+wasm-encoder = "0.248.0"
+
+# real crypto hosts
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+bn = { package = "zeropool-bn", version = "0.5.11", default-features = false }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+blst = { version = "0.3.17", features = ["portable"] }
+sha2 = "0.10"
+sha3 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+ripemd = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
