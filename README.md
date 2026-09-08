@@ -61,6 +61,38 @@ NEAR_MOCK_STATE=/tmp/meal.bin  # isolated state file
 
 Same inputs → same outputs, every time. Perfect for regression tests.
 
+## Library use (Rust)
+
+`MockChain` gives you the whole engine in-process — for CI tests that need no
+CLI, no state files, no process spawning:
+
+```rust
+use near_mock::chain::MockChain;
+
+let chain = MockChain::builder()
+    .contract("guestbook.test.near", "guestbook.wasm")?
+    .signer("alice.test.near")
+    .now(1_788_000_000)                    // deterministic clock
+    .build()?;
+
+let tx = chain.call("guestbook.test.near", "sign")
+    .args(r#"{"message":"hi"}"#).attach(1_000_000).fire()?;
+assert!(tx.ok);
+assert!(tx.gas_burned > 0);                // PV155-metered
+
+let n = chain.view("guestbook.test.near", "get_signature_count").fire()?;
+assert_eq!(n.return_string().as_deref(), Some("1"));
+
+chain.advance(3_600)?;                     // time-travel
+chain.save()?;                             // persist state file
+```
+
+Transaction semantics match mainnet: entry trap or failed receipt chain
+→ full rollback (deposit refunds); fire-and-forget receipts commit
+independently; `fail_receipt(n)` forces receipt failures for rollback tests.
+One `MockChain` per thread (the engine is thread-local). See
+`tests/chain_api.rs` for working examples.
+
 ## Introspection
 
 - `--trace` — host-call timeline + per-host gas

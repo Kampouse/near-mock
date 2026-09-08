@@ -1,0 +1,329 @@
+//! # `MockChain` — the library face of near-mock
+//!
+//! In-process NEAR contract execution for tests and tooling:
+//!
+//!
+//! ```no_run
+//! use near_mock::chain::MockChain;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let chain = MockChain::builder()
+//!     .contract("guestbook.test.near", "fixtures/guestbook.wasm")?
+//!     .state_path("/tmp/guestbook.bin")      // omit → in-memory only
+//!     .signer("alice.test.near")
+//!     .now(1_788_000_000)                    // deterministic clock (unix secs)
+//!     .build()?;
+//!
+//! let tx = chain
+//!     .call("guestbook.test.near", "sign")
+//!     .args("{}")
+//!     .fire()?;
+//! assert!(tx.ok);
+//!
+//! let view = chain
+//!     .view("guestbook.test.near", "get_signature_count")
+//!     .fire()?;
+//! assert!(view.ok);
+//!
+//! chain.advance(3_600);                   // time-travel one hour (pinned clock)
+//! chain.save()?;                          // explicit persist (needs state_path)
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Design notes:
+//! - The engine (promise DAG, modules, state) lives in thread-locals:
+//!   **one chain per thread**. Tests: run each `MockChain` in its own `#[test]`.
+//! - `call` = a NEAR transaction: atomic (entry trap or failed receipt chain
+//!   rolls back everything; attached deposit refunds), while fire-and-forget
+//!   orphan receipts commit independently — matching mainnet semantics.
+//! - `view` = read-only: write hosts refuse, nothing persists.
+//! - `fail_receipt(n)` mirrors the CLI's `--fail-receipt N` for testing
+//!   rollback paths.
+
+use std::sync::{Arc, Mutex};
+
+use crate::near_mock::{
+    advance_time, engine_tls, execute_tx, host_trace_reset, install_sandbox, mock_state_view_get,
+    mock_state_view_set, set_time_base, state_arc_tls, TxOutcome,
+};
+
+/// Result of one call — the CLI's outcome, minus the printing.
+#[derive(Debug, Clone)]
+pub struct CallOutcome {
+    /// `true` = the entry (or final callback receipt) committed.
+    pub ok: bool,
+    /// Entry return-data when no promise was returned; otherwise the last
+    /// receipt's result (NEAR transaction semantics).
+    pub return_data: Option<Vec<u8>>,
+    /// Receipt results in completion order (`None` = that receipt failed).
+    pub receipt_results: Vec<Option<Vec<u8>>>,
+    /// `true` when the ENTRY trapped (vs a receipt-chain failure).
+    pub entry_trapped: bool,
+    /// Error text (trap message / chain failure) when `!ok`.
+    pub error: Option<String>,
+    /// Fire-and-forget receipts that failed (parent tx still commits).
+    pub orphan_failures: usize,
+    /// Gas burned by the entry call (PV155 units; 1e12 = 1 TGas). Receipt
+    /// gas burns in per-receipt stores and is not included.
+    pub gas_burned: u64,
+}
+
+impl From<TxOutcome> for CallOutcome {
+    fn from(o: TxOutcome) -> Self {
+        CallOutcome {
+            ok: o.ok,
+            return_data: o.return_data,
+            receipt_results: o.receipt_results,
+            entry_trapped: o.entry_trapped,
+            error: o.error,
+            orphan_failures: o.orphan_failures,
+            gas_burned: o.entry_gas_burned,
+        }
+    }
+}
+
+impl CallOutcome {
+    /// Return-data as UTF-8 (lossy) — what the CLI prints as `📄`.
+    pub fn return_string(&self) -> Option<String> {
+        self.return_data
+            .as_ref()
+            .map(|d| String::from_utf8_lossy(d).into_owned())
+    }
+}
+
+/// Builder for [`MockChain`].
+pub struct ChainBuilder {
+    contracts: Vec<(String, Vec<u8>)>, // (account, wasm bytes)
+    storage: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    state_path: Option<String>,
+    signer: String,
+    now: Option<i64>,
+}
+
+impl Default for ChainBuilder {
+    fn default() -> Self {
+        Self {
+            contracts: Vec::new(),
+            storage: Default::default(),
+            state_path: None,
+            signer: "caller.test.near".into(),
+            now: None,
+        }
+    }
+}
+
+impl ChainBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a contract from a wasm file.
+    pub fn contract(
+        mut self,
+        account: &str,
+        wasm_path: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(wasm_path)
+            .map_err(|e| format!("wasm for {account} ({wasm_path}): {e}"))?;
+        self.contracts.push((account.into(), bytes));
+        Ok(self)
+    }
+
+    /// Register a contract from raw wasm bytes.
+    pub fn contract_bytes(mut self, account: &str, wasm: Vec<u8>) -> Self {
+        self.contracts.push((account.into(), wasm));
+        self
+    }
+
+    /// Start from a previously saved state file (`MockChain::save`,
+    /// `near-mock state dump`, or `near-mock snapshot`). Missing file = fresh.
+    pub fn state_path(mut self, path: &str) -> Self {
+        self.state_path = Some(path.into());
+        self
+    }
+
+    /// Default signer for `call`s (predecessor = signer, like a direct tx).
+    pub fn signer(mut self, account: &str) -> Self {
+        self.signer = account.into();
+        self
+    }
+
+    /// Pin the block-timestamp base (unix seconds). Enables `advance`.
+    pub fn now(mut self, unix_secs: i64) -> Self {
+        self.now = Some(unix_secs);
+        self
+    }
+
+    pub fn build(self) -> Result<MockChain, Box<dyn std::error::Error>> {
+        let mut fuel_cfg = wasmtime::Config::new();
+        fuel_cfg.consume_fuel(true);
+        fuel_cfg.max_wasm_stack(64 * 1024 * 1024);
+        fuel_cfg.async_stack_size(64 * 1024 * 1024);
+        let engine = std::rc::Rc::new(wasmtime::Engine::new(&fuel_cfg)?);
+
+        let mut modules = std::collections::HashMap::new();
+        for (acct, bytes) in &self.contracts {
+            modules.insert(acct.clone(), wasmtime::Module::from_binary(&engine, bytes)?);
+        }
+
+        let storage: std::collections::HashMap<Vec<u8>, Vec<u8>> = match &self.state_path {
+            Some(p) => std::fs::read(p)
+                .ok()
+                .and_then(|d| bincode::deserialize(&d).ok())
+                .unwrap_or_default(),
+            None => self.storage,
+        };
+
+        // TLS install — the same machinery the CLI uses.
+        let state = install_sandbox(engine, modules, storage, false)?;
+
+        if let Some(now) = self.now {
+            set_time_base(now);
+        }
+
+        Ok(MockChain {
+            state,
+            state_path: self.state_path,
+            signer: self.signer,
+        })
+    }
+}
+
+/// An in-process NEAR chain. **One per thread** (see module docs).
+pub struct MockChain {
+    state: Arc<Mutex<crate::near_mock::state::MockState>>,
+    state_path: Option<String>,
+    signer: String,
+}
+
+impl MockChain {
+    pub fn builder() -> ChainBuilder {
+        ChainBuilder::new()
+    }
+
+    /// The chain this thread currently has installed (CLI-parity shortcut).
+    pub fn current() -> Result<Self, Box<dyn std::error::Error>> {
+        let state = state_arc_tls().ok_or("no MockChain installed on this thread")?;
+        Ok(MockChain {
+            state,
+            state_path: None,
+            signer: "caller.test.near".into(),
+        })
+    }
+
+    /// Start building a transaction call.
+    pub fn call(&self, contract: &'static str, method: &'static str) -> CallBuilder {
+        CallBuilder {
+            contract,
+            method,
+            args: "{}".into(),
+            signer: self.signer.clone(),
+            attach: 0,
+            view: false,
+            fail_receipts: Vec::new(),
+        }
+    }
+
+    /// Read-only view call: write hosts refuse, nothing persists.
+    pub fn view(&self, contract: &'static str, method: &'static str) -> CallBuilder {
+        let mut b = self.call(contract, method);
+        b.view = true;
+        b
+    }
+
+    /// Advance the deterministic clock. No-op unless `now` was pinned.
+    pub fn advance(&self, secs: i64) {
+        advance_time(secs);
+    }
+
+    /// Persist current storage to `state_path`. Returns the key count.
+    pub fn save(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let path = self
+            .state_path
+            .as_ref()
+            .ok_or("MockChain::save: no state_path configured (builder .state_path())")?;
+        let st = self.state.lock().unwrap();
+        let n = st.storage.len();
+        let encoded = bincode::serialize(&st.storage)?;
+        std::fs::write(path, encoded)?;
+        Ok(n)
+    }
+
+    /// Number of storage keys across all account partitions.
+    pub fn storage_len(&self) -> usize {
+        self.state.lock().unwrap().storage.len()
+    }
+
+    /// Read one storage key under an account's partition (NEAR trie model).
+    pub fn storage_get(&self, account: &str, key: &[u8]) -> Option<Vec<u8>> {
+        let full = crate::near_mock::state::prefixed_key(account, key);
+        self.state.lock().unwrap().storage.get(&full).cloned()
+    }
+}
+
+/// Fluent call configuration (`MockChain::call` / `::view`).
+pub struct CallBuilder {
+    contract: &'static str,
+    method: &'static str,
+    args: String,
+    signer: String,
+    attach: u128,
+    view: bool,
+    fail_receipts: Vec<usize>,
+}
+
+impl CallBuilder {
+    /// JSON method args (default `{}`).
+    pub fn args(mut self, json: impl Into<String>) -> Self {
+        self.args = json.into();
+        self
+    }
+
+    /// Override the signer for this call.
+    pub fn from(mut self, account: impl Into<String>) -> Self {
+        self.signer = account.into();
+        self
+    }
+
+    /// Attach a deposit (decimal yocto), credited before the entry runs;
+    /// refunded automatically if the transaction fails.
+    pub fn attach(mut self, yocto: u128) -> Self {
+        self.attach = yocto;
+        self
+    }
+
+    /// Force receipt `idx` to fail (test rollback paths; CLI `--fail-receipt`).
+    pub fn fail_receipt(mut self, idx: usize) -> Self {
+        self.fail_receipts.push(idx);
+        self
+    }
+
+    /// Execute the call.
+    pub fn fire(self) -> Result<CallOutcome, Box<dyn std::error::Error>> {
+        let state = state_arc_tls().ok_or("no MockChain on this thread (build one first)")?;
+        let engine = engine_tls().ok_or("no MockChain engine on this thread")?;
+
+        // View mode is a flag on the shared MockState; flip it for the
+        // duration of a view call, restore whatever it was before.
+        let saved_view = mock_state_view_get(&state);
+        if self.view != saved_view {
+            mock_state_view_set(&state, self.view);
+        }
+        host_trace_reset();
+        let outcome = execute_tx(
+            &engine,
+            &state,
+            self.contract,
+            self.method,
+            &self.args,
+            &self.signer,
+            self.attach,
+            &self.fail_receipts,
+        );
+        if self.view != saved_view {
+            mock_state_view_set(&state, saved_view);
+        }
+        Ok(outcome?.into())
+    }
+}

@@ -8,3 +8,4 @@
 pub mod near_mock;
 
 pub use near_mock::main_entry;
+pub use near_mock::{chain, CallBuilder, CallOutcome, ChainBuilder, MockChain};

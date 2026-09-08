@@ -20,6 +20,9 @@ mod name_map;
 mod promises;
 mod schnorr;
 mod state;
+
+pub mod chain;
+pub use chain::{CallBuilder, CallOutcome, ChainBuilder, MockChain};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -122,12 +125,14 @@ pub(crate) fn validator_map() -> std::collections::BTreeMap<String, u128> {
 fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 5 {
         eprintln!(
-            "Usage: near-mock cross <state.bin> <acct=wasm,...> <contract-acct> <method> [args-json] [--fail-receipt N]\n       near-mock scenario <file.json>  (multi-step runner; steps support view/expect/fail_receipt)",
+            "Usage: near-mock cross <state.bin> <acct=wasm,...> <contract-acct> <method> [args-json] [--fail-receipt N]\n       near-mock call   <state.bin> <acct=wasm,...> <contract> <method> [args] [--signer S] [--attach N] [--view]\n       near-mock scenario <file.json>  (multi-step runner; steps support view/expect/fail_receipt)",
         );
         std::process::exit(1);
     }
     // Flags may appear anywhere after the `cross` keyword: --fail-receipt N (repeatable).
     let mut fail_receipts: Vec<usize> = Vec::new();
+    let mut signer_flag: Option<String> = None;
+    let mut attach_flag: Option<u128> = None;
     let mut pos: Vec<String> = Vec::new();
     {
         let mut it = args[2..].iter();
@@ -138,6 +143,15 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|x| x.parse::<usize>().ok())
                     .ok_or("--fail-receipt requires a receipt index N (see the [map] printout)")?;
                 fail_receipts.push(n);
+            } else if t == "--signer" {
+                signer_flag = Some(it.next().ok_or("--signer requires an account")?.clone());
+            } else if t == "--attach" {
+                attach_flag = Some(
+                    it.next()
+                        .ok_or("--attach requires decimal yocto")?
+                        .parse()
+                        .map_err(|_| "--attach must be decimal yocto")?,
+                );
             } else {
                 pos.push(t.clone());
             }
@@ -158,22 +172,115 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     fuel_cfg.consume_fuel(true);
     fuel_cfg.max_wasm_stack(64 * 1024 * 1024);
     fuel_cfg.async_stack_size(64 * 1024 * 1024);
-    let sync_engine = wasmtime::Engine::new(&fuel_cfg)?;
-    let engine = Rc::new(sync_engine);
+    let engine = Rc::new(wasmtime::Engine::new(&fuel_cfg)?);
 
     let state = init_sandbox(engine.clone(), manifest, state_path, run_view)?;
-    if !fail_receipts.is_empty() {
-        fail_receipts_set(&fail_receipts);
-    }
+    let signer = signer_flag
+        .or_else(|| std::env::var("NEAR_MOCK_SIGNER").ok())
+        .unwrap_or_else(|| "caller.test.near".into());
+    let attach: u128 = match attach_flag {
+        Some(a) => a,
+        None => std::env::var("NEAR_MOCK_ATTACH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().parse())
+            .transpose()
+            .map_err(|_| "NEAR_MOCK_ATTACH must be decimal yocto")?
+            .unwrap_or(0),
+    };
 
-    let signer = std::env::var("NEAR_MOCK_SIGNER").unwrap_or_else(|_| "caller.test.near".into());
+    let outcome = execute_tx(
+        &engine,
+        &state,
+        contract_acct,
+        method,
+        &args_json,
+        &signer,
+        attach,
+        &fail_receipts,
+    )?;
+    print_outcome(&outcome);
+
+    // Persist (library callers decide their own persistence; CLI writes the file)
+    let st = state.lock().unwrap();
+    if !st.storage.is_empty() {
+        let mut keys: Vec<(&Vec<u8>, &Vec<u8>)> = st.storage.iter().collect();
+        keys.sort();
+        println!("💾 Saved {} keys", keys.len());
+        let encoded = bincode::serialize(&st.storage)?;
+        std::fs::write(state_path, encoded)?;
+    }
+    Ok(())
+}
+
+/// CLI skin: prints the outcome of a shared-core execution.
+fn print_outcome(o: &TxOutcome) {
+    if o.ok {
+        println!("✅ Success");
+    } else {
+        println!("❌ {}", o.error.as_deref().unwrap_or("failed"));
+        println!(
+            "   ↺ {}rollback (single tx = atomic)",
+            if o.entry_trapped {
+                "entry trapped — full "
+            } else {
+                "full "
+            }
+        );
+    }
+    if let Some(d) = &o.return_data {
+        let s = String::from_utf8_lossy(d);
+        if !s.is_empty() {
+            println!("📄 {s}");
+        }
+    }
+}
+
+/// Shared transaction-execution core behind `cross`/`call` (CLI) and
+/// `MockChain::call` (library). Sets the exec context, credits any attached
+/// deposit, runs the entry with a pre-call snapshot (NEAR tx atomicity),
+/// resolves the promise DAG (root + fire-and-forget orphans, execute-once),
+/// and rolls back atomically on entry trap or receipt-chain failure.
+/// PERSISTENCE IS THE CALLER'S JOB — the core never touches the state file.
+pub(crate) struct TxOutcome {
+    /// Ok = entry (or final callback receipt) committed.
+    pub ok: bool,
+    /// Entry return-data when no promise was returned; otherwise the last
+    /// receipt's result (NEAR tx semantics).
+    pub return_data: Option<Vec<u8>>,
+    /// Receipt results in completion order (None = that receipt failed).
+    pub receipt_results: Vec<Option<Vec<u8>>>,
+    /// True when the ENTRY trapped (vs a receipt-chain failure).
+    pub entry_trapped: bool,
+    /// Error text for the failure case (trap message / chain failure).
+    pub error: Option<String>,
+    /// Fire-and-forget receipts that failed (parent tx still commits).
+    pub orphan_failures: usize,
+    /// Gas burned by the ENTRY call (wasmtime fuel; PV155 1:1). Receipt gas
+    /// burns in per-receipt stores and is not included here.
+    pub entry_gas_burned: u64,
+}
+
+pub(crate) fn execute_tx(
+    engine: &Rc<wasmtime::Engine>,
+    state: &Arc<Mutex<MockState>>,
+    contract_acct: &str,
+    method: &str,
+    args_json: &str,
+    signer: &str,
+    attach: u128,
+    fail_receipts: &[usize],
+) -> Result<TxOutcome, Box<dyn std::error::Error>> {
+    // Always set (not only when non-empty): a previous call on this thread
+    // must not leak its forced-failure receipt indices into this one.
+    fail_receipts_set(fail_receipts);
     EXEC_CTX.with(|c| {
         *c.borrow_mut() = Some(ExecCtx {
-            input: args_json.clone().into_bytes(),
-            signer: signer.clone(),
-            predecessor: signer.clone(),
-            contract: contract_acct.clone(),
-            view: run_view,
+            input: args_json.as_bytes().to_vec(),
+            signer: signer.to_string(),
+            predecessor: signer.to_string(),
+            contract: contract_acct.to_string(),
+            view: false,
         })
     });
 
@@ -184,80 +291,54 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             contract_acct
         ))?;
 
-    // Attached deposit (NEAR_MOCK_ATTACH=decimal yocto) — credited to the
-    // callee's NEAR balance before the entry runs, like a real receipt.
-    if let Ok(attach) = std::env::var("NEAR_MOCK_ATTACH") {
-        if !attach.is_empty() {
-            let amt: u128 = attach
-                .trim()
-                .parse()
-                .map_err(|_| "NEAR_MOCK_ATTACH must be decimal yocto")?;
-            let state0 = state.lock().unwrap();
-            let key = prefixed_key(contract_acct, b"\x00near-bal");
-            let bal: u128 = state0
-                .storage
-                .get(&key)
-                .and_then(|v| std::str::from_utf8(v).ok())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0u128);
-            let key_owned = key.clone();
-            drop(state0);
-            let mut state0 = state.lock().unwrap();
-            state0
-                .storage
-                .insert(key_owned, (bal + amt).to_string().into_bytes());
-            eprintln!(
-                "  💰 attached {} yocto → {} (bal {})",
-                amt,
-                contract_acct,
-                bal + amt
-            );
-        }
+    // Attached deposit (NEAR receipt semantics: value arrives before the
+    // entry runs). The snapshot below includes it; a failed tx refunds.
+    if attach > 0 {
+        credit_attach(state, contract_acct, attach)?;
     }
 
-    let mut store = wasmtime::Store::new(&*engine, ());
+    let mut store = wasmtime::Store::new(&**engine, ());
     store.set_fuel(PREPAID_FUEL.with(|f| *f.borrow()))?;
     let linker = build_env_linker(
         &mut store,
-        &*engine,
+        &**engine,
         state.clone(),
-        args_json.clone().into_bytes(),
+        args_json.as_bytes().to_vec(),
     )?;
     let instance = linker.instantiate(&mut store, &module)?;
 
     let func = instance
         .get_func(&mut store, method)
         .ok_or_else(|| format!("Method '{}' not found", method))?;
-    println!(
-        "▶ {}.{}({})",
-        contract_acct,
-        method,
-        if args_json == "{}" {
-            "".into()
-        } else {
-            args_json.clone()
-        }
-    );
+
     // PRE-call copy for NEAR transaction atomicity: the snapshot must capture
-    // state BEFORE the entry runs, or the Err-branch restore is a no-op and a
-    // trapped call keeps its writes (Ref add_liquidity proved it 2026-09-06).
-    // Taken after the attach credit: the deposit is part of the tx; the Err
-    // branch below subtracts it back out of the snapshot (refund on failure).
+    // state BEFORE the entry runs, or the Err-branch restore is a no-op (Ref
+    // add_liquidity proved it 2026-09-06). Taken after the attach credit: the
+    // deposit is part of the tx; the Err branch subtracts it back (refund).
     let mut tx_snapshot: HashMap<Vec<u8>, Vec<u8>> = state.lock().unwrap().storage.clone();
     let result = func.call(&mut store, &[], &mut []);
+    let mut outcome = TxOutcome {
+        ok: false,
+        return_data: None,
+        receipt_results: Vec::new(),
+        entry_trapped: false,
+        error: None,
+        orphan_failures: 0,
+        entry_gas_burned: 0,
+    };
     if result.is_err() {
+        outcome.entry_trapped = true;
+        outcome.error = Some(result.as_ref().err().unwrap().to_string());
         // entry failed: snapshot WITHOUT the attach credit → full refund
-        if let Ok(attach) = std::env::var("NEAR_MOCK_ATTACH") {
-            if let Ok(amt) = attach.trim().parse::<u128>() {
-                let key = prefixed_key(contract_acct, b"\x00near-bal");
-                if let Some(v) = tx_snapshot.get(&key).cloned() {
-                    let bal: u128 = String::from_utf8_lossy(&v).trim().parse().unwrap_or(0);
-                    let pre_bal = bal.saturating_sub(amt);
-                    if pre_bal > 0 {
-                        tx_snapshot.insert(key, pre_bal.to_string().into_bytes());
-                    } else {
-                        tx_snapshot.remove(&key);
-                    }
+        if attach > 0 {
+            let key = prefixed_key(contract_acct, b"\x00near-bal");
+            if let Some(v) = tx_snapshot.get(&key).cloned() {
+                let bal: u128 = String::from_utf8_lossy(&v).trim().parse().unwrap_or(0);
+                let pre_bal = bal.saturating_sub(attach);
+                if pre_bal > 0 {
+                    tx_snapshot.insert(key, pre_bal.to_string().into_bytes());
+                } else {
+                    tx_snapshot.remove(&key);
                 }
             }
         }
@@ -265,56 +346,42 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     match result {
         Ok(_) => {
-            println!("✅ Success");
+            outcome.ok = true;
             // Entry return-data is authoritative ONLY when no promise was
             // returned; with a promise the callback's result is the tx result.
             let pending = PENDING_RETURN.with(|p| *p.borrow());
             if pending.is_none() {
                 let st = state.lock().unwrap();
                 if let Some(ref data) = st.return_data {
-                    let s = String::from_utf8_lossy(data);
-                    if !s.is_empty() {
-                        println!("📄 {}", s);
+                    if !data.is_empty() {
+                        outcome.return_data = Some(data.clone());
                     }
                 }
             }
-            // Resolve any promise returned by the entry
+            // Resolve the promise DAG returned by the entry.
             if let Some(idx) = pending {
-                eprintln!("  ⛓ resolving promise DAG (root {})", idx);
-                if fail_receipts_any() {
-                    print_dag_map();
-                }
-                let dag = execute_promise(idx);
-                if let Err(e) = &dag {
-                    println!("❌ receipt chain failed: {}", e);
-                    println!("   ↺ full rollback (single tx = atomic)");
-                    let mut st = state.lock().unwrap();
-                    st.storage = tx_snapshot;
-                    drop(st);
-                    let st = state.lock().unwrap();
-                    let mut keys: Vec<(&Vec<u8>, &Vec<u8>)> = st.storage.iter().collect();
-                    keys.sort();
-                    println!("💾 Saved {} keys (rolled back)", keys.len());
-                    let encoded = bincode::serialize(&st.storage)?;
-                    std::fs::write(state_path, encoded)?;
-                    return Ok(());
-                }
-                let results = dag.unwrap();
-                let last = results.iter().rev().find_map(|r| r.as_ref().cloned());
-                if let Some(bytes) = last {
-                    let s = String::from_utf8_lossy(&bytes);
-                    if !s.is_empty() {
-                        println!("📄 {}", s);
+                match execute_promise(idx) {
+                    Err(e) => {
+                        outcome.ok = false;
+                        outcome.error = Some(format!("receipt chain failed: {e}"));
+                        // full rollback (single tx = atomic)
+                        let mut st = state.lock().unwrap();
+                        st.storage = tx_snapshot;
+                    }
+                    Ok(results) => {
+                        outcome.receipt_results = results.clone();
+                        if let Some(bytes) = results.iter().rev().find_map(|r| r.as_ref().cloned())
+                        {
+                            if !bytes.is_empty() {
+                                outcome.return_data = Some(bytes);
+                            }
+                        }
                     }
                 }
             }
             // Fire-and-forget receipts (2026-09-02): batches created but not
-            // part of any returned DAG still execute on-chain as independent
-            // receipts. The mock used to drop them silently — a promise to a
-            // phantom account vanished instead of failing like live NEAR
-            // (nostr-gov tk="nil" shipped through every gate). Drain any
-            // unexecuted batches in creation order; their failures do NOT
-            // roll back the parent tx (receipt independence).
+            // part of any returned DAG still execute as independent receipts;
+            // their failures do NOT roll back the parent tx.
             loop {
                 let next = PROMISE_DAG.with(|d| {
                     d.borrow()
@@ -324,37 +391,22 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .map(|(i, _)| i)
                 });
                 let Some(idx) = next else { break };
-                eprintln!("  ⛓ orphan receipt {} (fire-and-forget)", idx);
                 match execute_promise(idx) {
                     Ok(_) => {}
-                    Err(e) => println!(
-                        "❌ orphan receipt failed: {} (parent tx stays committed)",
-                        e
-                    ),
+                    Err(_) => outcome.orphan_failures += 1,
                 }
             }
         }
-        Err(e) => {
-            println!("❌ {}", e);
-            println!("   ↳ debug: {:?}", e);
-            println!("   ↺ entry trapped — full rollback (single tx = atomic)");
+        Err(_) => {
+            // entry trapped — full rollback (single tx = atomic)
             let mut st = state.lock().unwrap();
             st.storage = tx_snapshot;
         }
     }
-
-    // Persist
-    {
-        let st = state.lock().unwrap();
-        if !st.storage.is_empty() {
-            let mut keys: Vec<(&Vec<u8>, &Vec<u8>)> = st.storage.iter().collect();
-            keys.sort();
-            println!("💾 Saved {} keys", keys.len());
-            let encoded = bincode::serialize(&st.storage)?;
-            std::fs::write(state_path, encoded)?;
-        }
-    }
-    Ok(())
+    outcome.entry_gas_burned = PREPAID_FUEL
+        .with(|f| *f.borrow())
+        .saturating_sub(store.get_fuel().unwrap_or(u64::MAX));
+    Ok(outcome)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1080,18 +1132,91 @@ pub(crate) fn init_sandbox(
     } else {
         println!("📂 Loaded {} storage keys", loaded_storage.len());
     }
+    install_sandbox(engine, modules, loaded_storage, view)
+}
+
+/// TLS install shared by the CLI (`init_sandbox`) and the library
+/// (`chain::MockChain`). One chain per thread — the engine's promise DAG and
+/// module table are thread-locals, matching NEAR receipts being per-shard.
+pub(crate) fn install_sandbox(
+    engine: Rc<wasmtime::Engine>,
+    modules: HashMap<String, wasmtime::Module>,
+    storage: HashMap<Vec<u8>, Vec<u8>>,
+    view: bool,
+) -> Result<Arc<Mutex<MockState>>, Box<dyn std::error::Error>> {
     let state: Arc<Mutex<MockState>> = Arc::new(Mutex::new(MockState {
-        storage: loaded_storage,
+        storage,
         touched: Default::default(),
         registers: HashMap::new(),
         return_data: None,
         view,
     }));
-
+    // Genesis protocol state: seed the validator map ONCE at chain install if
+    // absent (NEAR_MOCK_VALIDATORS JSON or the mock pool default). Validators
+    // exist before any tx on a real chain — never written mid-execution, so
+    // trap rollbacks can't resurrect them (see hosts.rs validator comment).
+    if !state
+        .lock()
+        .unwrap()
+        .storage
+        .contains_key(b"\x00validators".as_slice())
+    {
+        let vals: std::collections::BTreeMap<String, String> = validator_map()
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect();
+        let json = serde_json::to_string(&vals).unwrap_or_else(|_| "{}".into());
+        state
+            .lock()
+            .unwrap()
+            .storage
+            .insert(b"\x00validators".to_vec(), json.into_bytes());
+    }
     MODULES.with(|m| *m.borrow_mut() = Some(Arc::new(modules)));
     STATE_ARC.with(|s| *s.borrow_mut() = Some(state.clone()));
     ENGINE_TLS.with(|e| *e.borrow_mut() = Some(engine.clone()));
     Ok(state)
+}
+
+// ── Library-API helpers (used by chain.rs; TLS is the engine's home) ──
+
+/// The installed shared state, if any (`MockChain`).
+pub(crate) fn state_arc_tls() -> Option<Arc<Mutex<MockState>>> {
+    STATE_ARC.with(|s| s.borrow().clone())
+}
+
+/// The installed engine, if any (`MockChain`).
+pub(crate) fn engine_tls() -> Option<std::rc::Rc<wasmtime::Engine>> {
+    ENGINE_TLS.with(|e| e.borrow().clone())
+}
+
+/// Read the sandbox view flag (`MockChain::view`).
+pub(crate) fn mock_state_view_get(state: &Arc<Mutex<MockState>>) -> bool {
+    state.lock().unwrap().view
+}
+
+/// Write the sandbox view flag (`MockChain::view`).
+pub(crate) fn mock_state_view_set(state: &Arc<Mutex<MockState>>, v: bool) {
+    state.lock().unwrap().view = v;
+}
+
+/// Pin the deterministic clock base (unix seconds) — library parity of
+/// `--now` / `NEAR_MOCK_NOW`.
+pub(crate) fn set_time_base(unix_secs: i64) {
+    RUN_CFG.with(|c| {
+        let mut cfg = c.borrow_mut();
+        let cfg = cfg.get_or_insert_with(RunCfg::default);
+        cfg.base_ts = Some(unix_secs);
+    });
+}
+
+/// Advance the deterministic clock by `secs` — library parity of `--advance`.
+pub(crate) fn advance_time(secs: i64) {
+    RUN_CFG.with(|c| {
+        let mut cfg = c.borrow_mut();
+        let cfg = cfg.get_or_insert_with(RunCfg::default);
+        cfg.advance_secs += secs;
+    });
 }
 
 /// Credit an attached deposit to the callee's NEAR balance (real receipt
@@ -1960,7 +2085,10 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("cross") {
+    if matches!(
+        args.get(1).map(|s| s.as_str()),
+        Some("cross") | Some("call")
+    ) {
         return run_cross(&args);
     }
     if args.get(1).map(|s| s.as_str()) == Some("scenario") {
