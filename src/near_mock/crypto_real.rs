@@ -239,8 +239,10 @@ mod tests {
             sum_in.extend_from_slice(&g_ser);
         }
         let sum_out = g1_sum(
-            crate::near_mock::bn254::split_elements::<{ crate::near_mock::bn254::G1_SUM_ELEMENT_SIZE }>(&sum_in)
-                .expect("65B-aligned sum input"),
+            crate::near_mock::bn254::split_elements::<
+                { crate::near_mock::bn254::G1_SUM_ELEMENT_SIZE },
+            >(&sum_in)
+            .expect("65B-aligned sum input"),
         )
         .expect("valid points sum");
 
@@ -249,8 +251,10 @@ mod tests {
         mx_in.extend_from_slice(&g_ser);
         mx_in.extend_from_slice(&encode_u256_pub(bn::arith::U256([2, 0])));
         let mx_out = g1_multiexp(
-            crate::near_mock::bn254::split_elements::<{ crate::near_mock::bn254::G1_MULTIEXP_ELEMENT_SIZE }>(&mx_in)
-                .expect("96B-aligned multiexp input"),
+            crate::near_mock::bn254::split_elements::<
+                { crate::near_mock::bn254::G1_MULTIEXP_ELEMENT_SIZE },
+            >(&mx_in)
+            .expect("96B-aligned multiexp input"),
         )
         .expect("valid multiexp");
 

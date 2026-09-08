@@ -15,8 +15,8 @@ mod bn254;
 mod crypto_real;
 mod ed25519;
 mod gas;
-mod name_map;
 mod hosts;
+mod name_map;
 mod promises;
 mod schnorr;
 mod state;
@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
-
 
 pub(crate) use gas::{
     apply_staking_delta, locked_balance_for, splitmix64, trie_charge, trie_charge_write,
@@ -1676,7 +1675,10 @@ fn run_snapshot(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .or_else(|| std::env::var("NEAR_RPC").ok())
-        .unwrap_or_else(|| "https://rpc.mainnet.near.org".to_string());
+        // Default chain: rpc.mainnet.near.org is deprecated (HTTP 429) and
+        // fastnear mainnet doesn't serve `view_state` for all contracts —
+        // archival works for both state and code, so it leads the fallbacks.
+        .unwrap_or_else(|| "https://archival-rpc.mainnet.near.org".to_string());
     let replace_acct = args.iter().any(|a| a == "--replace-acct");
     let want_code = !args.iter().any(|a| a == "--no-code");
 
@@ -2140,8 +2142,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?)
             .map_err(|e| format!("bad sidecar {}: {}", map_path, e))?;
         let wasm_bytes = std::fs::read(wasm_path)?;
-        let names = crate::near_mock::name_map::decode_function_names(&wasm_bytes)
-            .unwrap_or_default();
+        let names =
+            crate::near_mock::name_map::decode_function_names(&wasm_bytes).unwrap_or_default();
         // Resolve: numeric index → name via the section; otherwise direct name
         // match ("run:run" or "run"); wrapper names match their inner fn.
         let key: Option<String> = if let Ok(idx) = target.parse::<u32>() {
