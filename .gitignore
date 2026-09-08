@@ -1,2 +1,5 @@
 /target
 *.log
+
+# snapshot downloads contract code into cwd
+*.near.wasm
