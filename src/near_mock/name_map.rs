@@ -14,6 +14,13 @@
 
 use wasm_encoder::{Encode, NameMap, NameSection};
 
+// The encode/remap half of this module (name_section,
+// encode_function_names, remap_function_names) has no in-crate callers:
+// they serve lisp-rlm's compiler pipeline (the emitter writes the name
+// section after tree-shaking; the schnorr stitcher remaps indices across
+// the lib insertion). Kept here — next to the decoder that powers
+// `symbolicate` — and exercised by the roundtrip tests below.
+#[allow(dead_code)]
 /// Encode a function-name map as a `NameSection` (implements
 /// `wasm_encoder::Section`, so it can go straight into `m.section(...)`).
 pub fn name_section(function_names: &[(u32, String)]) -> NameSection {
@@ -26,6 +33,7 @@ pub fn name_section(function_names: &[(u32, String)]) -> NameSection {
     sec
 }
 
+#[allow(dead_code)] // used by lisp-rlm's emitter (see module note above)
 /// Encode a function-name map as a complete `name` custom section payload
 /// (section id 0, "name", function subsection 1).
 pub fn encode_function_names(function_names: &[(u32, String)]) -> Vec<u8> {
@@ -108,6 +116,7 @@ pub fn decode_function_names(wasm: &[u8]) -> Option<Vec<(u32, String)>> {
     None
 }
 
+#[allow(dead_code)] // used by lisp-rlm's stitcher (see module note above)
 /// Remap indices through `f`; entries whose mapping is None are dropped
 /// (matches wasm-opt deleting the function).
 pub fn remap_function_names(

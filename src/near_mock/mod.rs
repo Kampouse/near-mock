@@ -41,13 +41,14 @@ pub(crate) use state::{
     prefixed_key, restore_partition, snapshot_partition, state_file, write_reg_checked, MockState,
 };
 
-/// Per-node memoized promise results (execute-once semantics, 2026-09-08).
-/// Keyed by receipt index; entries die with the run (TLS, cleared with the
-/// DAG). A node reachable through two parents (Burrow's swap receipt feeds
-/// both the resolve callback and the payout leg) used to EXECUTE TWICE —
-/// pass 2 saw pass 1's consumed state and trapped
-/// (`There is no action for the position`). Now the second visit replays the
-/// memoized result, exactly like a data receipt on-chain.
+// Per-node memoized promise results (execute-once semantics, 2026-09-08).
+// Keyed by receipt index; entries die with the run (TLS, cleared with the
+// DAG). A node reachable through two parents (Burrow's swap receipt feeds
+// both the resolve callback and the payout leg) used to EXECUTE TWICE —
+// pass 2 saw pass 1's consumed state and trapped
+// (`There is no action for the position`). Now the second visit replays the
+// memoized result, exactly like a data receipt on-chain.
+// (plain comment: rustdoc cannot attach docs to a macro invocation)
 thread_local! {
     static PROMISE_OUTCOMES: std::cell::RefCell<std::collections::HashMap<usize, Vec<Option<Vec<u8>>>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
@@ -501,9 +502,6 @@ impl Default for RunCfg {
             debug: std::env::var("NEAR_MOCK_DEBUG")
                 .map(|v| v == "1")
                 .unwrap_or(false),
-            warn_stubs: std::env::var("NEAR_MOCK_WARN_STUBS")
-                .map(|v| v == "1")
-                .unwrap_or(false),
             base_ts: std::env::var("NEAR_MOCK_NOW")
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -543,7 +541,6 @@ fn mock_now_nanos() -> i64 {
 
 #[derive(Clone)]
 pub(crate) struct TraceEntry {
-    pub(crate) seq: u64,
     pub(crate) name: String,
     /// Exact gas charged by THIS host invocation (fuel delta across its body).
     pub(crate) gas: u64,
@@ -567,7 +564,6 @@ pub(crate) fn trace_host(name: &str, gas: u64, err: bool) {
     );
     if let Ok(mut g) = HOST_TRACE.lock() {
         g.get_or_insert_with(Vec::new).push(TraceEntry {
-            seq,
             name: name.to_string(),
             gas,
             err,
@@ -592,9 +588,12 @@ pub(crate) fn host_trace_reset() {
     }
 }
 
-/// Per-host aggregation: (total_gas, [(host, calls, gas)]) sorted by gas desc.
-/// Returns zeros when tracing is off; drains the buffer.
-pub(crate) fn host_trace_summary() -> (u64, Vec<(String, u64, u64)>) {
+/// Per-host aggregation: (total_gas, [(host, calls, errors, gas)]) sorted
+/// by gas desc. Returns zeros when tracing is off; drains the buffer.
+/// The error count surfaces failed host calls (ProhibitedInView refusals,
+/// host traps) in the summary — without it they were only visible by
+/// scrolling the live timeline.
+pub(crate) fn host_trace_summary() -> (u64, Vec<(String, u64, u64, u64)>) {
     let entries = match HOST_TRACE.lock() {
         Ok(mut g) => g.take().unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -606,14 +605,18 @@ pub(crate) fn host_trace_summary() -> (u64, Vec<(String, u64, u64)>) {
         return (0, Vec::new());
     }
     let total: u64 = entries.iter().map(|e| e.gas).sum();
-    let mut agg: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut agg: HashMap<String, (u64, u64, u64)> = HashMap::new();
     for e in &entries {
-        let slot = agg.entry(e.name.clone()).or_insert((0, 0));
+        let slot = agg.entry(e.name.clone()).or_insert((0, 0, 0));
         slot.0 += 1;
-        slot.1 += e.gas;
+        if e.err {
+            slot.1 += 1;
+        }
+        slot.2 += e.gas;
     }
-    let mut rows: Vec<(String, u64, u64)> = agg.into_iter().map(|(k, (c, g))| (k, c, g)).collect();
-    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let mut rows: Vec<(String, u64, u64, u64)> =
+        agg.into_iter().map(|(k, (c, e, g))| (k, c, e, g)).collect();
+    rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
     (total, rows)
 }
 
@@ -633,7 +636,18 @@ pub(crate) fn print_host_trace_summary() {
         total as f64 / 1e9
     );
     for r in rows.iter().take(12) {
-        println!("  {:>12.3}G  {:>4}×  {}", r.2 as f64 / 1e9, r.1, r.0);
+        let err_note = if r.2 > 0 {
+            format!("  ❌{}err", r.2)
+        } else {
+            String::new()
+        };
+        println!(
+            "  {:>12.3}G  {:>4}×  {}{}",
+            r.3 as f64 / 1e9,
+            r.1,
+            r.0,
+            err_note
+        );
     }
     if rows.len() > 12 {
         println!("  … {} more hosts", rows.len() - 12);
@@ -680,10 +694,9 @@ fn safe_report<F: FnOnce()>(label: &str, f: F) {
     }
 }
 
-/// Execute one function call on `account`'s contract in a FRESH Store
-/// (never re-enter a live instance — the heap global would be clobbered).
-/// Signer/predecessor = `predecessor` (promise calls aren't user-signed).
-/// Returns Some(return-bytes) on success, None on trap (state reverted).
+// (docs for sub_execute moved to its definition in promises.rs — a doc
+// comment here would attach to the thread_local! macro invocation, which
+// rustdoc cannot annotate)
 thread_local! {
     /// The CURRENT receipt's attached deposit. Set by sub_execute for
     /// batch function-call children (was: silently dropped — dep_ptr was
@@ -2319,7 +2332,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  --state <path>        state file (default /tmp/near-mock-state.bin; = NEAR_MOCK_STATE)");
         println!("  NEAR_MOCK_SEED        pin random_seed (string, zero-padded to 64 hex)");
         println!("  NEAR_MOCK_DEBUG=1     same as --debug");
-        println!("  NEAR_MOCK_WARN_STUBS=1  warn on unimplemented host stubs");
     }
 
     fn print_gas_schedule_default() {
@@ -2846,8 +2858,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host_trace_summary()
                         .1
                         .into_iter()
-                        .map(|(n, c, g)| {
-                            serde_json::json!({"host": n, "calls": c, "gas_tgas": g as f64 / 1e12})
+                        .map(|(n, c, e, g)| {
+                            serde_json::json!({"host": n, "calls": c, "errors": e, "gas_tgas": g as f64 / 1e12})
                         })
                         .collect::<Vec<_>>(),
                 )
