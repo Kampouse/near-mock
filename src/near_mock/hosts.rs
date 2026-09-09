@@ -113,9 +113,18 @@ pub(crate) fn build_env_linker(
                 let data = mem.data(&caller);
                 if ptr + len <= data.len() {
                     let mut st = s2.lock().unwrap();
-                    if st.return_data.is_none() {
-                        st.return_data = Some(data[ptr..ptr + len].to_vec());
-                    }
+                    // LAST-write-wins — nearcore semantics. The old
+                    // first-write guard diverged from the chain: a contract
+                    // calling value_return twice (e.g. jsonReturnStr("1")
+                    // followed by an export-level `return 0`, which the TS
+                    // frontend also lowers to value_return) returned the
+                    // FIRST value on the mock and the LAST on-chain
+                    // (dogfooded live via registry-nostrgov.testnet
+                    // 2026-09-09: chain said "0", mock said "1" — the
+                    // divergence masked a real contract bug). Receipt
+                    // isolation is unaffected: sub_execute saves/clears/
+                    // restores return_data around sub-calls structurally.
+                    st.return_data = Some(data[ptr..ptr + len].to_vec());
                 }
             }
             Ok(())
