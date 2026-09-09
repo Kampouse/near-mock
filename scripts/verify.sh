@@ -210,6 +210,27 @@ check "contract sees --deposit (sputnik store)" "✅ Success" "$out"
 out=$($NM state dump "$WORK/sp1.bin" sputnik-dao.near 2>/dev/null | jq -e 'length >= 2' >/dev/null 2>&1 && echo SPOK)
 check "store persisted code + balance" "SPOK" "$out"
 
+# C8 (0.1.8): cross --json — used to fall into the positionals and be silently
+# ignored (and, placed before the args, could swallow them via the pos.get(4)
+# slot). Same JSON contract as the single-wasm runner + receipt fields.
+out=$($NM cross "$WORK/js1.bin" "gb.test.near=$WASM" gb.test.near get_signature_count '{}' --json 2>/dev/null | grep '^JSON')
+check "cross --json outcome ok" '"outcome":"ok"' "$out"
+check "cross --json gas" 'gas_burned_tgas' "$out"
+check "cross --json return" '"return":0' "$out"
+check "cross --json storage diff" '"added"' "$out"
+check "cross --json receipts field" '"receipts":0' "$out"
+out=$($NM cross "$WORK/js2.bin" "gb.test.near=$WASM" gb.test.near get_signature_count --json '{}' 2>/dev/null | grep '^JSON')
+check "--json before args doesn't swallow args" '"outcome":"ok"' "$out"
+out=$($NM cross "$WORK/js3.bin" "gb.test.near=$WASM" gb.test.near sign --json '{"message":"flag order"}' 2>&1)
+check "args after flags not swallowed (--json)" "✅ Success" "$out"
+$NM cross "$WORK/js4.bin" "gb.test.near=$WASM" gb.test.near sign '{}' --json >/dev/null 2>&1
+[ $? -ne 0 ] && ok "cross --json trap exits nonzero" || bad "cross --json trap exit 0"
+out=$($NM cross "$WORK/js4.bin" "gb.test.near=$WASM" gb.test.near sign '{}' --json 2>/dev/null | grep '^JSON')
+check "cross --json trap outcome" '"outcome":"trap"' "$out"
+check "cross --json error surfaced" '"entry_trapped":true' "$out"
+out=$($NM cross "$WORK/js5.bin" "gb.test.near=$WASM" gb.test.near get_signatures --notarealflag '{}' 2>&1)
+check "unknown cross flag warns loudly" "ignores unrecognized flag" "$out"
+
 # --version / -V: version string from Cargo.toml, exit 0
 out=$($NM --version 2>&1); rc=$?
 check "--version prints pkg version" "near-mock 0\." "$out"

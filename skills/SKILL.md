@@ -15,7 +15,7 @@ Real wasm, real host surface (~140 fns incl. protocol 69/72), deterministic
 clock/entropy, receipt-atomic state — executed in-process in milliseconds.
 
 ```bash
-cargo install near-mock    # 0.1.7+
+cargo install near-mock    # 0.1.8+
 ```
 
 ## The four modes
@@ -49,7 +49,7 @@ near-mock cross state.bin some-contract.testnet=some-contract.testnet.wasm \
 | `--view` | read-only: writes refused (ProhibitedInView), no persist |
 | `--dry-run` | execute + report, don't persist |
 | `--staking` | enforce 1e20 yocto/byte storage staking |
-| `--json` | machine-readable outcome (return value, gas, storage diff, events) |
+| `--json` | machine-readable outcome (return value, gas, storage diff, events) — ALL modes incl. `cross` (≥0.1.8) |
 | `--trace` | host-call timeline + per-host gas (incl. error counts since 0.1.2) |
 
 ## Exit codes (CI-safe since 0.1.1)

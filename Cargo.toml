@@ -1,6 +1,6 @@
 [package]
 name = "near-mock"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Local NEAR contract runner — real contracts, real hosts, deterministic, no node"
 license = "MIT"

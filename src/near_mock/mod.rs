@@ -126,14 +126,19 @@ pub(crate) fn validator_map() -> std::collections::BTreeMap<String, u128> {
 fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 5 {
         eprintln!(
-            "Usage: near-mock cross <state.bin> <acct=wasm,...> <contract-acct> <method> [args-json] [--fail-receipt N] [--attach N] [--deposit N]\n       near-mock call   <state.bin> <acct=wasm,...> <contract> <method> [args] [--signer S] [--attach N] [--deposit N] [--view]\n       near-mock scenario <file.json>  (multi-step runner; steps support view/expect/fail_receipt)",
+            "Usage: near-mock cross <state.bin> <acct=wasm,...> <contract-acct> <method> [args-json] [--fail-receipt N] [--attach N] [--deposit N] [--view] [--json]\n       near-mock call   <state.bin> <acct=wasm,...> <contract> <method> [args] [--signer S] [--attach N] [--deposit N] [--view] [--json]\n       near-mock scenario <file.json>  (multi-step runner; steps support view/expect/fail_receipt)",
         );
         std::process::exit(1);
     }
-    // Flags may appear anywhere after the `cross` keyword: --fail-receipt N (repeatable).
+    // Flags may appear anywhere after the `cross` keyword: --fail-receipt N
+    // (repeatable), --signer/--attach/--deposit, --view, --json. Anything
+    // else '-'-prefixed lands in `pos` and gets a loud warning — the silent
+    // swallowing is how --deposit (0.1.7) and --json (0.1.8) broke here.
     let mut fail_receipts: Vec<usize> = Vec::new();
     let mut signer_flag: Option<String> = None;
     let mut attach_flag: Option<u128> = None;
+    let mut run_view = false;
+    let mut json_out = false;
     let mut pos: Vec<String> = Vec::new();
     {
         let mut it = args[2..].iter();
@@ -156,7 +161,18 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .parse()
                         .map_err(|_| "--attach/--deposit must be decimal yocto")?,
                 );
+            } else if t == "--view" {
+                // consumed here (0.1.8): left in `pos` it could occupy the
+                // args-json slot and silently swallow the real args
+                run_view = true;
+            } else if t == "--json" {
+                json_out = true;
+            } else if t == "--once" {
+                // accepted no-op (single-wasm parity, script compat)
             } else {
+                if t.starts_with('-') {
+                    eprintln!("  ⚠ cross mode ignores unrecognized flag '{t}'");
+                }
                 pos.push(t.clone());
             }
         }
@@ -174,7 +190,6 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.starts_with('-'))
         .cloned()
         .unwrap_or_else(|| "{}".into());
-    let run_view = pos.iter().any(|a| a == "--view");
 
     let mut fuel_cfg = Config::new();
     fuel_cfg.consume_fuel(true);
@@ -183,6 +198,10 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Rc::new(wasmtime::Engine::new(&fuel_cfg)?);
 
     let state = init_sandbox(engine.clone(), manifest, state_path, run_view)?;
+    // Pre-tx storage copy for the --json diff (execute_tx keeps its own
+    // rollback snapshot internally; this one spans the whole CLI call,
+    // attach credit included).
+    let pre_state: HashMap<Vec<u8>, Vec<u8>> = state.lock().unwrap().storage.clone();
     let signer = signer_flag
         .or_else(|| std::env::var("NEAR_MOCK_SIGNER").ok())
         .unwrap_or_else(|| "caller.test.near".into());
@@ -210,14 +229,91 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     print_outcome(&outcome);
 
-    // Persist (library callers decide their own persistence; CLI writes the file)
-    let st = state.lock().unwrap();
-    if !st.storage.is_empty() {
-        let mut keys: Vec<(&Vec<u8>, &Vec<u8>)> = st.storage.iter().collect();
-        keys.sort();
-        println!("💾 Saved {} keys", keys.len());
-        let encoded = bincode::serialize(&st.storage)?;
-        std::fs::write(state_path, encoded)?;
+    // Persist (library callers decide their own persistence; CLI writes the file).
+    // Scoped: the --json block below takes its own lock.
+    {
+        let st = state.lock().unwrap();
+        if !st.storage.is_empty() {
+            let mut keys: Vec<(&Vec<u8>, &Vec<u8>)> = st.storage.iter().collect();
+            keys.sort();
+            println!("💾 Saved {} keys", keys.len());
+            let encoded = bincode::serialize(&st.storage)?;
+            std::fs::write(state_path, encoded)?;
+        }
+    }
+
+    // --json (0.1.8): the same machine-readable contract as the single-wasm
+    // runner (outcome/return/gas/storage/events), plus the cross-specific
+    // receipt fields. Before 0.1.8 the flag fell into the positionals and
+    // was silently ignored.
+    if json_out {
+        let hex_key = |k: &[u8]| -> String { k.iter().map(|b| format!("{b:02x}")).collect() };
+        let st = state.lock().unwrap();
+        let mut added: Vec<(String, usize)> = Vec::new();
+        let mut changed: Vec<(String, usize, usize)> = Vec::new();
+        let mut removed: Vec<String> = Vec::new();
+        for (k, v) in &st.storage {
+            match pre_state.get(k) {
+                None => added.push((hex_key(k), v.len())),
+                Some(old) if old != v => changed.push((hex_key(k), old.len(), v.len())),
+                _ => {}
+            }
+        }
+        for k in pre_state.keys() {
+            if !st.storage.contains_key(k) {
+                removed.push(hex_key(k));
+            }
+        }
+        let outcome_str = if outcome.ok {
+            "ok"
+        } else if outcome
+            .error
+            .as_deref()
+            .map(|e| e.contains("all fuel consumed"))
+            .unwrap_or(false)
+        {
+            "out_of_gas"
+        } else {
+            "trap"
+        };
+        let json_return = outcome.return_data.as_ref().map(|d| {
+            serde_json::from_slice::<serde_json::Value>(d).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(d).into_owned())
+            })
+        });
+        let prepaid = PREPAID_FUEL.with(|f| *f.borrow());
+        let j = serde_json::json!({
+            "outcome": outcome_str,
+            "return": json_return,
+            "error": outcome.error,
+            "entry_trapped": outcome.entry_trapped,
+            "receipts": outcome.receipt_results.len(),
+            "orphan_failures": outcome.orphan_failures,
+            "gas_burned_tgas": outcome.entry_gas_burned as f64 / 1e12,
+            "gas_prepaid_tgas": prepaid as f64 / 1e12,
+            "logs": LOG_COUNT.with(|l| *l.borrow()),
+            "events": JSON_EVENTS.with(|e| e.borrow().clone()),
+            "storage": {
+                "keys_total": st.storage.len(),
+                "added": added,
+                "changed": changed,
+                "removed": removed,
+            },
+            "host_trace": if mock_cfg().trace {
+                Some(
+                    host_trace_summary()
+                        .1
+                        .into_iter()
+                        .map(|(n, c, e, g)| {
+                            serde_json::json!({"host": n, "calls": c, "errors": e, "gas_tgas": g as f64 / 1e12})
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            },
+        });
+        println!("JSON {}", serde_json::to_string(&j).unwrap_or_default());
     }
     // CI contract: a failed tx exits nonzero (traps/out-of-gas/failed
     // receipts must never look green). Orphan receipt failures do NOT
