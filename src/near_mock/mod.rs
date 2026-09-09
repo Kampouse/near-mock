@@ -2289,6 +2289,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.get(1).map(|s| s.as_str()) == Some("snapshot") {
         return run_snapshot(&args);
     }
+    // `skill [--stdout|--force]` — install the AI-agent skill into this
+    // project (.agents/skills/near-mock/). Embedded via include_str! —
+    // self-contained binary, same pattern as near-compile 0.1.2.
+    if args.get(1).map(|s| s.as_str()) == Some("skill") {
+        const SKILL_MD: &str = include_str!("../../skills/SKILL.md");
+        const SKILL_SCENARIO: &str = include_str!("../../skills/example-scenario.json");
+        if args.iter().skip(2).any(|a| a == "--stdout") {
+            print!("{}", SKILL_MD);
+            return Ok(());
+        }
+        let force = args.iter().skip(2).any(|a| a == "--force");
+        let dir = std::path::Path::new(".agents/skills/near-mock");
+        std::fs::create_dir_all(dir)?;
+        let mut written = Vec::new();
+        for (name, content) in [
+            ("SKILL.md", SKILL_MD),
+            ("example-scenario.json", SKILL_SCENARIO),
+        ] {
+            let path = dir.join(name);
+            if path.exists() && !force {
+                continue;
+            }
+            std::fs::write(&path, content)?;
+            written.push(path.display().to_string());
+        }
+        if written.is_empty() {
+            println!("skill already present (use --force to overwrite)");
+        } else {
+            for w in &written {
+                println!("✅ {}", w);
+            }
+            println!("agents working in this project will now discover it");
+        }
+        return Ok(());
+    }
     fn print_main_usage() {
         println!("near-mock — local NEAR contract runner (wasmtime, no node)");
         println!();
@@ -2304,6 +2339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  near-mock state import <state.bin> <dump.json|- > [--replace-acct]");
         println!("  near-mock state dump <state.bin> [account-prefix]  (stdout = JSON)");
         println!("  near-mock snapshot <account> <state.bin>  (pull live wasm+state via RPC)");
+        println!("  near-mock skill [--stdout|--force]  (install the AI-agent skill here)");
         println!();
         println!("ARGS:");
         println!("  <args-json>  JSON string, or @file for raw bytes (NUL/invalid UTF-8 ok)");

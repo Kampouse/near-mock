@@ -198,6 +198,25 @@ check "dump prefix filter finds default account" "FILTEROK" "$out"
 out=$($NM cross "$WORK/ns.bin" "escrow.test.near=$WASM" escrow.test.near get_signature_count 2>/dev/null)
 check "cross reads single-call state (same account)" "📄 1" "$out"
 
+# skill ships with the binary (0.1.6): frontmatter present, command works
+out=$($NM skill --stdout 2>/dev/null | head -2 | tail -1)
+check "skill --stdout carries frontmatter name" "name: near-mock" "$out"
+
+# shellcheck disable=SC2312
+SKILLTEST="$WORK/skillproj"; mkdir -p "$SKILLTEST"
+out=$(cd "$SKILLTEST" && $NM skill 2>&1)
+check "skill installs into project" "SKILL.md" "$out"
+[ -f "$SKILLTEST/.agents/skills/near-mock/example-scenario.json" ] \
+  && ok "skill scenario example included" || bad "scenario example missing"
+
+# shellcheck disable=SC2312
+out=$(cd "$SKILLTEST" && $NM skill 2>&1)
+check "skill skip-if-exists" "already present" "$out"
+
+# shellcheck disable=SC2312
+out=$(cd "$SKILLTEST" && $NM skill --force 2>&1)
+check "skill --force overwrites" "✅" "$out"
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 [ $fail -eq 0 ]

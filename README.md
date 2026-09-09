@@ -34,7 +34,21 @@ near-mock pyth.bin --view some_method '{}'
 
 # 3. Or script a whole cross-contract flow
 near-mock scenario my_flow.json
+
+# 4. Make your project agent-aware
+near-mock skill    # installs .agents/skills/near-mock/ (SKILL.md + scenario example)
 ```
+
+## The AI-agent skill
+
+`near-mock skill` writes `.agents/skills/near-mock/` into the current
+project — coding agents (Zed, etc.) working there automatically learn the
+runner's patterns: the four execution modes, determinism controls, the
+scenario-runner step fields, live-snapshot forensics, state surgery, and
+the chain-parity verification technique. `--stdout` prints it instead;
+`--force` overwrites. Every scaffolded `near-compile init` project gets a
+sibling near-compile skill; this one covers the runner side for contracts
+of any origin (Rust near-sdk included).
 
 ## What's real
 
