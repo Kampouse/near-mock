@@ -619,9 +619,12 @@ pub(crate) fn build_env_linker(
         move |mut caller, args, _| {
             let ptr = args[0].unwrap_i64() as usize;
             // Real host shape: 16 LE bytes of THIS receipt's deposit.
-            // Reads NEAR_MOCK_ATTACH (same var the balance-credit path
-            // uses — was always 0: the auction protocol reads it, and
-            // value-receiving entries silently saw nothing. 2026-09-01.)
+            // CURRENT_DEPOSIT is set by execute_tx for the top-level entry
+            // (from --attach/--deposit/NEAR_MOCK_ATTACH, ≥0.1.7) and by
+            // sub_execute for promise children. The env var remains as the
+            // single-wasm runner's fallback. (Was always 0 for cross/call
+            // flag runs: the auction protocol reads it, and value-receiving
+            // entries silently saw nothing. 2026-09-01; entry wiring 0.1.7.)
             let amt: u128 = CURRENT_DEPOSIT
                 .with(|d| *d.borrow())
                 .or_else(|| {

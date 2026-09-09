@@ -81,36 +81,63 @@ fn trapped_tx_is_atomic() {
 
 #[test]
 fn attached_deposit_commits_and_refunds() {
+    // Since 0.1.7 the entry's attach is visible to attached_deposit() inside
+    // the contract (CURRENT_DEPOSIT wiring in execute_tx). guestbook `sign`
+    // is NOT payable — its compiled-in near-sdk guard must reject the call
+    // (real NEAR semantics; previously the host fn read 0 and hid this) and
+    // the rejected deposit must be refunded in full.
     let chain = gb_chain();
-    let deposit: u128 = 1_234_500_000;
-
-    // Success: deposit credited to the callee before entry runs.
     let tx = chain
         .call(GB, "sign")
         .args(r#"{"message":"paid"}"#)
+        .attach(1_234_500_000)
+        .fire()
+        .expect("fire");
+    assert!(!tx.ok, "non-payable method must reject the deposit");
+    assert!(tx.entry_trapped);
+    assert!(
+        chain.storage_get(GB, b"\x00near-bal").is_none(),
+        "rejected deposit must be refunded (no balance key)"
+    );
+
+    // Payable commit path: the REAL sputnik-dao.near factory (near-sdk
+    // 5.24.1, #[payable] store). It sees the deposit, stores the input as
+    // contract code, and the credit commits to its balance.
+    const SPUT: &str = "sputnik-dao.near";
+    let chain2 = MockChain::builder()
+        .contract(SPUT, "fixtures/sputnik_factory.wasm")
+        .expect("fixture wasm")
+        .signer(SPUT) // factory owner defaults to current_account_id
+        .now(1_788_000_000)
+        .build()
+        .expect("build chain");
+    let init = chain2.call(SPUT, "new").args("{}").fire().expect("fire");
+    assert!(init.ok, "factory new: {:?}", init.error);
+
+    let deposit: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
+    let tx2 = chain2
+        .call(SPUT, "store")
+        .args("{}")
         .attach(deposit)
         .fire()
         .expect("fire");
-    assert!(tx.ok);
-    let bal = chain.storage_get(GB, b"\x00near-bal").expect("balance key");
+    assert!(
+        tx2.ok,
+        "payable store must see the deposit: {:?}",
+        tx2.error
+    );
+    let bal = chain2
+        .storage_get(SPUT, b"\x00near-bal")
+        .expect("balance key");
     assert_eq!(
         std::str::from_utf8(&bal).unwrap().parse::<u128>().unwrap(),
-        deposit
-    );
-
-    // Failure: deposit refunded (full rollback, snapshot excludes the credit).
-    let tx2 = chain
-        .call(GB, "sign")
-        .args("not json")
-        .attach(777)
-        .fire()
-        .expect("fire");
-    assert!(!tx2.ok);
-    let bal2 = chain.storage_get(GB, b"\x00near-bal").unwrap();
-    assert_eq!(
-        std::str::from_utf8(&bal2).unwrap().parse::<u128>().unwrap(),
         deposit,
-        "failed tx must not keep its attach"
+        "successful deposit commits to the callee balance"
+    );
+    assert_eq!(
+        chain2.storage_len(),
+        4,
+        "validators + STATE + stored code + balance"
     );
 }
 

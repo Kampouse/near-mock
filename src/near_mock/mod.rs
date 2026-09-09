@@ -126,7 +126,7 @@ pub(crate) fn validator_map() -> std::collections::BTreeMap<String, u128> {
 fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 5 {
         eprintln!(
-            "Usage: near-mock cross <state.bin> <acct=wasm,...> <contract-acct> <method> [args-json] [--fail-receipt N]\n       near-mock call   <state.bin> <acct=wasm,...> <contract> <method> [args] [--signer S] [--attach N] [--view]\n       near-mock scenario <file.json>  (multi-step runner; steps support view/expect/fail_receipt)",
+            "Usage: near-mock cross <state.bin> <acct=wasm,...> <contract-acct> <method> [args-json] [--fail-receipt N] [--attach N] [--deposit N]\n       near-mock call   <state.bin> <acct=wasm,...> <contract> <method> [args] [--signer S] [--attach N] [--deposit N] [--view]\n       near-mock scenario <file.json>  (multi-step runner; steps support view/expect/fail_receipt)",
         );
         std::process::exit(1);
     }
@@ -146,12 +146,15 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 fail_receipts.push(n);
             } else if t == "--signer" {
                 signer_flag = Some(it.next().ok_or("--signer requires an account")?.clone());
-            } else if t == "--attach" {
+            } else if t == "--attach" || t == "--deposit" {
+                // --deposit is the spelling documented in --help FLAGS; it used
+                // to fall through into `pos` here and be silently dropped, so
+                // cross/call always saw attached_deposit() == 0.
                 attach_flag = Some(
                     it.next()
-                        .ok_or("--attach requires decimal yocto")?
+                        .ok_or("--attach/--deposit requires decimal yocto")?
                         .parse()
-                        .map_err(|_| "--attach must be decimal yocto")?,
+                        .map_err(|_| "--attach/--deposit must be decimal yocto")?,
                 );
             } else {
                 pos.push(t.clone());
@@ -302,6 +305,12 @@ pub(crate) fn execute_tx(
     EXECUTED_PROMISES.with(|e| e.borrow_mut().clear());
     PROMISE_RESULTS.with(|r| *r.borrow_mut() = Vec::new());
     PENDING_RETURN.with(|p| *p.borrow_mut() = None);
+    // The ENTRY receipt's deposit: attached_deposit() inside the contract
+    // reads CURRENT_DEPOSIT (promise children get theirs from sub_execute).
+    // Before 0.1.7 the cross/call path credited the balance but left the
+    // host fn blind — the contract read 0 unless NEAR_MOCK_ATTACH happened
+    // to be set (flag and env-var runs diverged on the same amount).
+    CURRENT_DEPOSIT.with(|d| *d.borrow_mut() = Some(attach));
     EXEC_CTX.with(|c| {
         *c.borrow_mut() = Some(ExecCtx {
             input: args_json.as_bytes().to_vec(),
@@ -434,6 +443,9 @@ pub(crate) fn execute_tx(
     outcome.entry_gas_burned = PREPAID_FUEL
         .with(|f| *f.borrow())
         .saturating_sub(store.get_fuel().unwrap_or(u64::MAX));
+    // Receipt hygiene: don't leak the entry's deposit into the next tx on
+    // this thread (the library MockChain path runs many calls in-process).
+    CURRENT_DEPOSIT.with(|d| *d.borrow_mut() = None);
     Ok(outcome)
 }
 
@@ -2411,8 +2423,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(200.0); // NEAR default prepaid gas per function call
     let prepaid_g: u64 = (prepaid_tgas * 1e12) as u64;
-    // --deposit <yocto>: wired into the same path the cross driver uses
-    // (NEAR_MOCK_ATTACH) so attached_deposit() sees it. Was silently ignored.
+    // --deposit <yocto> for the single-wasm runner: exported through the
+    // env var the tx core reads (NEAR_MOCK_ATTACH). cross/call return from
+    // main() before reaching this — they parse --deposit natively in
+    // run_cross's flag loop.
     if let Some(d) = flag_val("--deposit") {
         std::env::set_var("NEAR_MOCK_ATTACH", d.trim());
     }

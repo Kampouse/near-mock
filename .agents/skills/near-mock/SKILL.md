@@ -15,7 +15,7 @@ Real wasm, real host surface (~140 fns incl. protocol 69/72), deterministic
 clock/entropy, receipt-atomic state — executed in-process in milliseconds.
 
 ```bash
-cargo install near-mock    # 0.1.6+
+cargo install near-mock    # 0.1.7+
 ```
 
 ## The four modes
@@ -41,7 +41,7 @@ near-mock cross state.bin some-contract.testnet=some-contract.testnet.wasm \
 | Var / flag | Effect |
 |---|---|
 | `NEAR_MOCK_SIGNER` | signer + predecessor for the call |
-| `NEAR_MOCK_ATTACH` | attached deposit (yocto) |
+| `NEAR_MOCK_ATTACH` / `--attach` / `--deposit` | attached deposit (yocto) — flags work in ALL modes incl. `cross` (≥0.1.7) |
 | `NEAR_MOCK_NOW` / `--now` | pin block timestamp (unix secs) |
 | `--advance <secs>` | time-travel (scenario steps accumulate it) |
 | `NEAR_MOCK_SEED` | pin random_seed |

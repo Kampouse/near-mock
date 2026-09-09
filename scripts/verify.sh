@@ -174,8 +174,41 @@ check "missing wasm names manifest escape" "override with" "$out"
 # C5: omitted args-json must default to {}, not feed the first flag to the contract
 out=$($NM "$WASM" get_signatures --view --state "$WORK/c5a.bin" 2>&1)
 if printf '%s' "$out" | grep -q "deserialize input"; then bad "single-call C5: flag fed as args"; else ok "single-call C5: omitted args-json defaults to {}"; fi
-out=$($NM cross "$WORK/c5b.bin" "gb=$WASM" gb.test.near get_signatures --view 2>&1)
+out=$($NM cross "$WORK/c5b.bin" "gb.test.near=$WASM" gb.test.near get_signatures --view 2>&1)
 if printf '%s' "$out" | grep -q "deserialize input"; then bad "cross C5: flag fed as args"; else ok "cross C5: omitted args-json defaults to {}"; fi
+
+# C6 (0.1.7): cross/call --deposit — used to fall into the positionals and be
+# silently dropped, so attached_deposit() always read 0. Oracle: the pre-entry
+# 💰 credit line (and the persisted \x00near-bal balance). NOTE: manifest keys
+# must equal the account id — a mismatch errors "not in manifest" (the C5
+# cross line above used to pass vacuously with a mismatched key).
+out=$($NM cross "$WORK/dep1.bin" "gb.test.near=$WASM" gb.test.near get_signatures --deposit 123456789 2>&1); rc=$?
+check "cross --deposit credited" "💰 attached 123456789 yocto" "$out"
+[ $rc -eq 0 ] && ok "cross --deposit exit 0" || bad "cross --deposit exit $rc"
+check "deposit persisted as near-bal" "MTIzNDU2Nzg5" "$($NM state dump "$WORK/dep1.bin" 2>/dev/null)"
+out=$($NM cross "$WORK/dep2.bin" "gb.test.near=$WASM" gb.test.near get_signatures --attach 123456789 2>&1)
+check "cross --attach still credited" "💰 attached 123456789 yocto" "$out"
+out=$($NM cross "$WORK/dep3.bin" "gb.test.near=$WASM" gb.test.near get_signatures 2>&1)
+if printf '%s' "$out" | grep -q "attached"; then bad "no flag ⇒ spurious deposit credit"; else ok "no flag ⇒ no deposit credit"; fi
+out=$($NM cross "$WORK/dep4.bin" "gb.test.near=$WASM" gb.test.near get_signatures --deposit notanumber 2>&1); rc=$?
+[ $rc -ne 0 ] && ok "cross --deposit rejects non-numeric" || bad "cross --deposit took garbage"
+check "cross --deposit garbage error msg" "must be decimal yocto" "$out"
+out=$($NM cross "$WORK/dep5.bin" "gb.test.near=$WASM" gb.test.near get_signatures --deposit 2>&1); rc=$?
+[ $rc -ne 0 ] && ok "cross --deposit missing value rejected" || bad "dangling --deposit accepted"
+check "cross --deposit missing value msg" "requires decimal yocto" "$out"
+
+# C7 (0.1.7): the entry's attach must reach attached_deposit() INSIDE the
+# contract (CURRENT_DEPOSIT wiring in execute_tx). Was: only the env-var
+# fallback fed the host fn — flags credited the balance but the contract
+# read 0. Oracle: the REAL sputnik-dao.near factory (near-sdk 5.24.1) whose
+# payable `store` deterministically traps when it sees a 0 deposit.
+SPUT="$FIX/sputnik_factory.wasm"
+$NM cross "$WORK/sp1.bin" "sputnik-dao.near=$SPUT" sputnik-dao.near new '{}' >/dev/null 2>&1
+out=$($NM cross "$WORK/sp1.bin" "sputnik-dao.near=$SPUT" sputnik-dao.near store '{}' --signer sputnik-dao.near --deposit 1000000000000000000000000 2>&1); rc=$?
+check "contract sees --deposit (sputnik store)" "✅ Success" "$out"
+[ $rc -eq 0 ] && ok "sputnik store exit 0" || bad "sputnik store exit $rc"
+out=$($NM state dump "$WORK/sp1.bin" sputnik-dao.near 2>/dev/null | jq -e 'length >= 2' >/dev/null 2>&1 && echo SPOK)
+check "store persisted code + balance" "SPOK" "$out"
 
 # --version / -V: version string from Cargo.toml, exit 0
 out=$($NM --version 2>&1); rc=$?
