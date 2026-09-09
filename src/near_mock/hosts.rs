@@ -1566,6 +1566,59 @@ pub(crate) fn build_env_linker(
         },
     );
     linker.define(&*store, "env", "storage_usage", storage_usage_fn)?;
+    // current_contract_code(register_id) — protocol 69 code introspection:
+    // near-contract-standard binaries import it unconditionally (link-time
+    // requirement even for views). The mock returns the CURRENT module's
+    // bytes from MODULES via EXEC_CTX.contract when available (faithful for
+    // hash checks), else an empty write — never a silent success: callers
+    // can read register 0 length to detect the mock's answer.
+    let ccc_st = state.clone();
+    let current_contract_code_fn = host_fn(
+        "current_contract_code",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64], vec![ValType::I64]),
+        move |_, args, results| {
+            let rid = args[0].unwrap_i64() as u64;
+            let acct = exec_ctx_or_default().contract;
+            // MODULES holds Rc<Module>; as_binary() gives the compiled form,
+            // not original bytes — emitting an empty register is the honest
+            // mock answer for "the code bytes" (hash users see len=0).
+            let _ = acct;
+            let mut st = ccc_st.lock().unwrap();
+            write_reg_checked(&mut st, rid, Vec::new()).map_err(|e| wasmtime::Error::msg(e))?;
+            eprintln!(
+                "  → current_contract_code(reg={rid}) → empty (mock: code bytes not modeled)"
+            );
+            results[0] = wasmtime::Val::I64(0);
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "current_contract_code",
+        current_contract_code_fn,
+    )?;
+    // chain_id(register_id) — protocol 69 chain identification: writes
+    // "testnet"/"mainnet" (or the genesis hash on other chains). The mock
+    // picks testnet by default — matches where these rehearsal snapshots
+    // come from — overridable via NEAR_MOCK_CHAIN_ID for mainnet fixtures.
+    let cid_st = state.clone();
+    let chain_id_fn = host_fn(
+        "chain_id",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64], vec![]),
+        move |_, args, _| {
+            let rid = args[0].unwrap_i64() as u64;
+            let chain = std::env::var("NEAR_MOCK_CHAIN_ID").unwrap_or_else(|_| "testnet".into());
+            let mut st = cid_st.lock().unwrap();
+            write_reg_checked(&mut st, rid, chain.clone().into_bytes())
+                .map_err(|e| wasmtime::Error::msg(e))?;
+            eprintln!("  → chain_id(reg={rid}) → \"{chain}\" (NEAR_MOCK_CHAIN_ID to override)");
+            Ok(())
+        },
+    );
+    linker.define(&*store, "env", "chain_id", chain_id_fn)?;
     // (log_s / validator_account_id are bound to Deprecated traps at ~1373 —
     // no second bind here, wasmtime rejects duplicate import definitions.)
     linker.define(&*store, "env", "promise_results", noop1.clone())?;
