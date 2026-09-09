@@ -6,7 +6,13 @@ set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 FIX="$DIR/../fixtures"
 WASM="$FIX/guestbook.wasm"
-NM="$DIR/../target/release/near-mock"
+# prefer release, fall back to debug — CI runs `cargo test` (debug only)
+# and shouldn't need a 6-minute release build just to verify
+if [ -x "$DIR/../target/release/near-mock" ]; then
+  NM="$DIR/../target/release/near-mock"
+else
+  NM="$DIR/../target/debug/near-mock"
+fi
 # portable workdir: $TMPDIR when set (sandboxed macOS / CI deny /tmp), /tmp otherwise
 WORK="${TMPDIR:-/tmp}/nmverify.$$"
 mkdir -p "$WORK"
