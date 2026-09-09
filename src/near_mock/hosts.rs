@@ -1917,6 +1917,304 @@ pub(crate) fn build_env_linker(
         delete_account_fn,
     )?;
 
+    // ── Protocol 69/72-era hosts (near-sdk 5 binaries import these at link
+    // time even when never called — wasmtime requires every import bound, so
+    // views on such contracts CRASHED at instantiation before these existed;
+    // dogfooded against susuplus.susumi.testnet, 2026-09-08). They record
+    // into the promise DAG like the other batch actions; drain-time behavior
+    // is documented on the PAction variants.
+    let t2gk = host_fn(
+        "promise_batch_action_transfer_to_gas_key",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 4], vec![]),
+        move |caller, args, _| {
+            let (idx, key_len, key_ptr, amt_ptr) = (
+                args[0].unwrap_i64() as usize,
+                args[1].unwrap_i64() as usize,
+                args[2].unwrap_i64() as usize,
+                args[3].unwrap_i64() as usize,
+            );
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| {
+                    wasmtime::Error::msg("MemoryAccessViolation: transfer_to_gas_key")
+                })?;
+            let md = mem.data(&caller);
+            if key_ptr + key_len > md.len() || amt_ptr + 16 > md.len() {
+                return Err(wasmtime::Error::msg(
+                    "MemoryAccessViolation: transfer_to_gas_key",
+                ));
+            }
+            let _key = &md[key_ptr..key_ptr + key_len]; // implicit account derivation not modeled
+            let amt = u128::from_le_bytes(md[amt_ptr..amt_ptr + 16].try_into().unwrap());
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::TransferToGasKey { amount: amt });
+                } else {
+                    panic!("InvalidPromiseIndex: transfer_to_gas_key");
+                }
+            });
+            eprintln!("  ↗ transfer_to_gas_key {amt} yocto");
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_transfer_to_gas_key",
+        t2gk,
+    )?;
+
+    // add_gas_key_*: same shape as add_key_* (ED25519 33B pk), recorded as
+    // AddGasKey — the mock applies no gas-key rules.
+    let agk_full = host_fn(
+        "promise_batch_action_add_gas_key_with_full_access",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 4], vec![]),
+        move |caller, args, _| {
+            let (idx, pk_len, pk_ptr, _nonce) = (
+                args[0].unwrap_i64() as usize,
+                args[1].unwrap_i64() as usize,
+                args[2].unwrap_i64() as usize,
+                args[3].unwrap_i64(),
+            );
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmtime::Error::msg("MemoryAccessViolation: add_gas_key"))?;
+            let md = mem.data(&caller);
+            if pk_len != 33 || pk_ptr + pk_len > md.len() {
+                return Err(wasmtime::Error::msg("MemoryAccessViolation: add_gas_key"));
+            }
+            let pk = md[pk_ptr..pk_ptr + pk_len].to_vec();
+            if pk[0] != 0xED {
+                return Err(wasmtime::Error::msg(
+                    "AddKeyInvalidKey: only ED25519 (0xED-prefixed) keys supported",
+                ));
+            }
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::AddGasKey { pk });
+                } else {
+                    panic!("InvalidPromiseIndex: add_gas_key");
+                }
+            });
+            eprintln!("  🔑 add_gas_key(full-access) — recorded, no enforcement");
+            Ok(())
+        },
+    );
+    let agk_fc = host_fn(
+        "promise_batch_action_add_gas_key_with_function_call",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 9], vec![]),
+        move |caller, args, _| {
+            let idx = args[0].unwrap_i64() as usize;
+            let pk_len = args[1].unwrap_i64() as usize;
+            let pk_ptr = args[2].unwrap_i64() as usize;
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmtime::Error::msg("MemoryAccessViolation: add_gas_key_fc"))?;
+            let md = mem.data(&caller);
+            if pk_len != 33 || pk_ptr + pk_len > md.len() {
+                return Err(wasmtime::Error::msg(
+                    "MemoryAccessViolation: add_gas_key_fc",
+                ));
+            }
+            let pk = md[pk_ptr..pk_ptr + pk_len].to_vec();
+            if pk[0] != 0xED {
+                return Err(wasmtime::Error::msg(
+                    "AddKeyInvalidKey: only ED25519 (0xED-prefixed) keys supported",
+                ));
+            }
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::AddGasKey { pk });
+                } else {
+                    panic!("InvalidPromiseIndex: add_gas_key_fc");
+                }
+            });
+            eprintln!("  🔑 add_gas_key(function-call) — recorded, no enforcement");
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_add_gas_key_with_full_access",
+        agk_full,
+    )?;
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_add_gas_key_with_function_call",
+        agk_fc,
+    )?;
+
+    // global contracts (protocol 69): deploy/use record onto the DAG; no
+    // global-contract cache exists in the mock — drain-time loud no-ops.
+    let dgc = host_fn(
+        "promise_batch_action_deploy_global_contract",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 3], vec![]),
+        move |caller, args, _| {
+            let (idx, len, ptr) = (
+                args[0].unwrap_i64() as usize,
+                args[1].unwrap_i64() as usize,
+                args[2].unwrap_i64() as usize,
+            );
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmtime::Error::msg("MemoryAccessViolation: global_contract"))?;
+            let md = mem.data(&caller);
+            if ptr + len > md.len() {
+                return Err(wasmtime::Error::msg(
+                    "MemoryAccessViolation: global_contract",
+                ));
+            }
+            let code = md[ptr..ptr + len].to_vec();
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::DeployGlobalContract { code });
+                } else {
+                    panic!("InvalidPromiseIndex: deploy_global_contract");
+                }
+            });
+            eprintln!("  ⚠ deploy_global_contract — recorded, no cache in mock");
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_deploy_global_contract",
+        dgc,
+    )?;
+    let dgc_by = host_fn(
+        "promise_batch_action_deploy_global_contract_by_account_id",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 3], vec![]),
+        |caller, args, _| {
+            let (idx, len, ptr) = (
+                args[0].unwrap_i64() as usize,
+                args[1].unwrap_i64() as usize,
+                args[2].unwrap_i64() as usize,
+            );
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmtime::Error::msg("MemoryAccessViolation: global_contract"))?;
+            let md = mem.data(&caller);
+            if ptr + len > md.len() {
+                return Err(wasmtime::Error::msg(
+                    "MemoryAccessViolation: global_contract",
+                ));
+            }
+            let code = md[ptr..ptr + len].to_vec();
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::DeployGlobalContract { code });
+                } else {
+                    panic!("InvalidPromiseIndex: deploy_global_contract");
+                }
+            });
+            eprintln!("  ⚠ deploy_global_contract_by_account_id — recorded, no cache");
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_deploy_global_contract_by_account_id",
+        dgc_by,
+    )?;
+    let ugc = host_fn(
+        "promise_batch_action_use_global_contract",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 3], vec![]),
+        move |caller, args, _| {
+            let (idx, len, ptr) = (
+                args[0].unwrap_i64() as usize,
+                args[1].unwrap_i64() as usize,
+                args[2].unwrap_i64() as usize,
+            );
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| {
+                    wasmtime::Error::msg("MemoryAccessViolation: use_global_contract")
+                })?;
+            let md = mem.data(&caller);
+            if ptr + len > md.len() {
+                return Err(wasmtime::Error::msg(
+                    "MemoryAccessViolation: use_global_contract",
+                ));
+            }
+            let account_id = String::from_utf8_lossy(&md[ptr..ptr + len]).to_string();
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::UseGlobalContract {
+                        account_id: account_id.clone(),
+                    });
+                } else {
+                    panic!("InvalidPromiseIndex: use_global_contract");
+                }
+            });
+            eprintln!("  ⚠ use_global_contract({account_id}) — no-op in mock");
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_use_global_contract",
+        ugc,
+    )?;
+    let ugc_by = host_fn(
+        "promise_batch_action_use_global_contract_by_account_id",
+        &mut *store,
+        FuncType::new(engine, vec![ValType::I64; 3], vec![]),
+        |caller, args, _| {
+            let (idx, len, ptr) = (
+                args[0].unwrap_i64() as usize,
+                args[1].unwrap_i64() as usize,
+                args[2].unwrap_i64() as usize,
+            );
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .ok_or_else(|| {
+                    wasmtime::Error::msg("MemoryAccessViolation: use_global_contract")
+                })?;
+            let md = mem.data(&caller);
+            if ptr + len > md.len() {
+                return Err(wasmtime::Error::msg(
+                    "MemoryAccessViolation: use_global_contract",
+                ));
+            }
+            let account_id = String::from_utf8_lossy(&md[ptr..ptr + len]).to_string();
+            PROMISE_DAG.with(|d| {
+                if let Some(b) = d.borrow_mut().get_mut(idx) {
+                    b.actions.push(PAction::UseGlobalContract {
+                        account_id: account_id.clone(),
+                    });
+                } else {
+                    panic!("InvalidPromiseIndex: use_global_contract");
+                }
+            });
+            eprintln!("  ⚠ use_global_contract_by_account_id({account_id}) — no-op");
+            Ok(())
+        },
+    );
+    linker.define(
+        &*store,
+        "env",
+        "promise_batch_action_use_global_contract_by_account_id",
+        ugc_by,
+    )?;
+
     // Real promise hosts (cross engine) — override the noops. STATE_ARC is
     // set by the drivers; when unset (defensive), noops remain.
     if STATE_ARC.with(|s| s.borrow().is_some()) {

@@ -32,6 +32,30 @@ pub(crate) enum PAction {
     DeleteAccount {
         beneficiary: String,
     },
+    /// promise_batch_action_transfer_to_gas_key (protocol 72+ / near-sdk 5):
+    /// transfer to the gas-key holder's implicit account. The mock treats it
+    /// as a Transfer (no staking-gas-key account model) — semantics are
+    /// receipt-level identical for balance purposes.
+    TransferToGasKey {
+        amount: u128,
+    },
+    /// add_gas_key_with_full_access / add_gas_key_with_function_call
+    /// (protocol 72+): restricted access keys for gas payments. Recorded;
+    /// the mock's key model is ED25519-existence-only, so no enforcement.
+    AddGasKey {
+        pk: Vec<u8>,
+    },
+    /// deploy/use global contract (protocol 69): contract-code sharing across
+    /// accounts. The mock has no global-contract cache — deploying records
+    /// DeployGlobal (treated as DeployContract of the same bytes would need a
+    /// code copy the driver doesn't model); use_* records UseGlobal. Contracts
+    /// depending on global-contract EXECUTION semantics will not behave.
+    DeployGlobalContract {
+        code: Vec<u8>,
+    },
+    UseGlobalContract {
+        account_id: String,
+    },
 }
 
 #[derive(Clone)]
@@ -467,6 +491,73 @@ fn execute_promise_uncached(
                     // TRUE NEAR: successful transfer = Successful(empty).
                     // Contracts distinguish it from Failed via
                     // near/promise_succeeded (status probe). No more marker.
+                    out.push(Some(vec![]));
+                }
+                PAction::TransferToGasKey { amount } => {
+                    // protocol 72+ transfer_to_gas_key: the mock has no
+                    // gas-key account model — apply it as a plain transfer
+                    // (balance moves; the gas-key bookkeeping is out of
+                    // scope). Loud note so nobody mistakes it for the real
+                    // staking-gas mechanics.
+                    eprintln!(
+                        "  ⚠ transfer_to_gas_key {amount} yocto → {} (mock: applied as plain transfer; gas-key accounting not modeled)",
+                        batch.account
+                    );
+                    let state = STATE_ARC.with(|s| s.borrow().clone()).ok_or("no state")?;
+                    let mut st = state.lock().unwrap();
+                    let debit_key = prefixed_key(&batch.creator, b"\x00near-bal");
+                    let bal: u128 = st
+                        .storage
+                        .get(&debit_key)
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0u128);
+                    if bal < *amount {
+                        eprintln!("  ⚠ transfer_to_gas_key INSUFFICIENT (receipt reverts)");
+                        for (k, v) in batch_touched.iter() {
+                            match v {
+                                Some(val) => {
+                                    st.storage.insert(k.clone(), val.clone());
+                                }
+                                None => {
+                                    st.storage.remove(k);
+                                }
+                            }
+                        }
+                        out.push(None);
+                        break;
+                    }
+                    batch_touched.push((debit_key.clone(), st.storage.get(&debit_key).cloned()));
+                    st.storage
+                        .insert(debit_key, (bal - *amount).to_string().into_bytes());
+                    let credit_key = prefixed_key(&batch.account, b"\x00near-bal");
+                    batch_touched.push((credit_key.clone(), st.storage.get(&credit_key).cloned()));
+                    let rbal: u128 = st
+                        .storage
+                        .get(&credit_key)
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0u128);
+                    let rbal = rbal + *amount;
+                    st.storage.insert(credit_key, rbal.to_string().into_bytes());
+                    out.push(Some(vec![]));
+                }
+                PAction::AddGasKey { pk: _ } => {
+                    // recorded for the promise trace; the mock's key model
+                    // (ED25519 existence-only) applies — no enforcement.
+                    eprintln!("  🔑 add_gas_key (recorded; mock applies no gas-key rules)");
+                    out.push(Some(vec![]));
+                }
+                PAction::DeployGlobalContract { code: _ } => {
+                    eprintln!(
+                        "  ⚠ deploy_global_contract (recorded ONLY — the mock has no global-contract cache; use_* receipts will not execute code)"
+                    );
+                    out.push(Some(vec![]));
+                }
+                PAction::UseGlobalContract { account_id } => {
+                    eprintln!(
+                        "  ⚠ use_global_contract({account_id}) (no-op in mock — no global-contract cache)"
+                    );
                     out.push(Some(vec![]));
                 }
                 PAction::Stake { amount } => {
