@@ -181,6 +181,11 @@ at a pinned block; writes land locally (tombstones keep deletions from
 resurrecting). Validated byte-identical to RPC's own view execution
 (`tests/fork.rs --ignored`).
 
+`--block` accepts a height (pinned, reproducible forever), `final`
+(always-fresh `finality: "final"` on every fetch — state may drift
+mid-session; opt-in liveness over determinism), or is omitted (latest,
+resolved once and pinned).
+
 **No state-size limit**: unpaginated `view_state` refuses large contracts
 (`TOO_LARGE_CONTRACT_STATE`), but the paginated path (`limit` +
 `after_key_base64`) has no such check — fork-mode pages through it.

@@ -116,6 +116,8 @@ pub struct ChainBuilder {
     /// block ("anvil --fork-url" style). Contracts may be empty — code and
     /// storage arrive on demand; local writes shadow the fork.
     fork: Option<(String, Option<u64>)>,
+    /// Unpinned fork: `finality: "final"` on every fetch (opt-in drift).
+    fork_final: Option<String>,
 }
 
 impl Default for ChainBuilder {
@@ -127,6 +129,7 @@ impl Default for ChainBuilder {
             signer: "caller.test.near".into(),
             now: None,
             fork: None,
+            fork_final: None,
         }
     }
 }
@@ -174,18 +177,28 @@ impl ChainBuilder {
     }
 
     /// Fork mainnet (or any chain) at a block: contract code and storage are
-    /// paged in lazily from `rpc` (archival) at `block` (None = latest).
+    /// paged in lazily from `rpc` (archival) at `block` (None = latest,
+    /// resolved once and pinned — deterministic per session).
     /// Local calls execute against that state; writes shadow it.
     pub fn fork(mut self, rpc: &str, block: Option<u64>) -> Self {
         self.fork = Some((rpc.to_string(), block));
         self
     }
 
+    /// Fork with always-fresh state: every fetch uses `finality: "final"`
+    /// (state may drift mid-session; reproducibility is traded for liveness).
+    pub fn fork_final(mut self, rpc: &str) -> Self {
+        self.fork_final = Some(rpc.to_string());
+        self
+    }
+
     pub fn build(self) -> Result<MockChain, Box<dyn std::error::Error>> {
-        if let Some((rpc, block)) = &self.fork {
+        if let Some(rpc) = &self.fork_final {
+            crate::near_mock::set_fork_cfg(rpc.clone(), None);
+        } else if let Some((rpc, block)) = &self.fork {
             let block = match block {
-                Some(b) => *b,
-                None => crate::near_mock::fork_latest_block(rpc)?,
+                Some(b) => Some(*b),
+                None => Some(crate::near_mock::fork_latest_block(rpc)?),
             };
             crate::near_mock::set_fork_cfg(rpc.clone(), block);
         }

@@ -2197,7 +2197,7 @@ thread_local! {
 }
 
 /// Install fork config into RUN_CFG (library builder + CLI both use this).
-pub(crate) fn set_fork_cfg(rpc: String, block: u64) {
+pub(crate) fn set_fork_cfg(rpc: String, block: Option<u64>) {
     RUN_CFG.with(|c| {
         let mut slot = c.borrow_mut();
         let mut cfg = slot.take().unwrap_or_default();
@@ -2247,6 +2247,14 @@ pub(crate) fn fork_latest_block(rpc: &str) -> Result<u64, Box<dyn std::error::Er
     Err(format!("fork_latest_block failed: {last}").into())
 }
 
+/// The block reference for fork queries: pinned height or "final".
+pub(crate) fn fork_block_ref(cfg: &crate::near_mock::gas::ForkCfg) -> serde_json::Value {
+    match cfg.block {
+        Some(b) => serde_json::json!({ "block_id": b }),
+        None => serde_json::json!({ "finality": "final" }),
+    }
+}
+
 pub(crate) fn fork_enabled() -> bool {
     mock_cfg().fork.is_some()
 }
@@ -2261,9 +2269,18 @@ pub(crate) fn fork_get_module(
         return Some(m);
     }
     let cfg = mock_cfg().fork?;
-    let params = serde_json::json!({
-        "request_type": "view_code", "account_id": account, "block_id": cfg.block
+    let mut params = serde_json::json!({
+        "request_type": "view_code", "account_id": account
     });
+    if let (k, v) = fork_block_ref(&cfg)
+        .as_object()
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+    {
+        params[k] = v.clone();
+    }
     let res = rpc_query(&cfg.rpc, params).ok()?;
     let code_b64 = res.get("code_base64")?.as_str()?;
     use base64::Engine;
@@ -2279,6 +2296,8 @@ pub(crate) fn fork_get_module(
         bytes.len(),
         account,
         cfg.block
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "final".into())
     );
     Some(module)
 }
@@ -2312,9 +2331,18 @@ pub(crate) fn fork_page_in(
     for _page in 0..8 {
         let mut params = serde_json::json!({
             "request_type": "view_state", "account_id": contract,
-            "prefix_base64": prefix_b64, "block_id": cfg.block,
+            "prefix_base64": prefix_b64,
             "limit": 100u32,
         });
+        if let (k, v) = fork_block_ref(&cfg)
+            .as_object()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+        {
+            params[k] = v.clone();
+        }
         if let Some(after) = &cursor {
             use base64::Engine;
             params["after_key_base64"] =
@@ -2379,7 +2407,9 @@ pub(crate) fn fork_page_in(
         fetched,
         contract,
         crate::near_mock::hosts::dbg_key(raw_key),
-        cfg.block,
+        cfg.block
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "final".into()),
         found_exact
     );
     found_exact
@@ -2898,25 +2928,31 @@ fn run_fork(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let deposit: u128 = val("--deposit").and_then(|d| d.parse().ok()).unwrap_or(0);
     let is_view = flag("--view").is_some();
 
-    let block = match val("--block").and_then(|b| b.parse::<u64>().ok()) {
-        Some(b) => b,
+    match val("--block").as_deref() {
+        Some("final") => {
+            println!("🍴 fork: {account} @ final (unpinned — state may drift mid-session)");
+            set_fork_cfg(rpc.clone(), None);
+        }
+        Some(s) => {
+            let b: u64 = s.parse().map_err(|_| usage)?;
+            println!("🍴 fork: {account} @ block {b}");
+            set_fork_cfg(rpc.clone(), Some(b));
+        }
         None => {
             let b = fork_latest_block(&rpc)?;
-            println!("🍴 fork: {} @ latest block {b}", account);
-            b
+            println!("🍴 fork: {account} @ latest block {b} (pinned)");
+            set_fork_cfg(rpc.clone(), Some(b));
         }
-    };
-    set_fork_cfg(rpc.clone(), block);
+    }
 
     // The forked account is the default signer — its state is what we read.
     let signer = signer.unwrap_or_else(|| account.clone());
     let account_static: &str = Box::leak(account.clone().into_boxed_str());
     let method_static: &str = Box::leak(method.clone().into_boxed_str());
 
-    let chain = MockChain::builder()
-        .fork(&rpc, Some(block))
-        .signer(&signer)
-        .build()?;
+    // fork cfg was set explicitly above (pinned / final / latest-pinned);
+    // the builder just installs the sandbox — .fork() would re-resolve.
+    let chain = MockChain::builder().signer(&signer).build()?;
     println!(
         "▶ {account}.{method}({args_json}){}",
         if is_view { " [view]" } else { "" }

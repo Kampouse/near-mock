@@ -190,7 +190,9 @@ impl GasSchedule {
 #[derive(Clone, Debug)]
 pub(crate) struct ForkCfg {
     pub(crate) rpc: String,
-    pub(crate) block: u64,
+    /// Pinned block for all fetches. `None` = `finality: "final"` on every
+    /// request (always-fresh, but state may drift mid-session — opt-in).
+    pub(crate) block: Option<u64>,
 }
 
 /// Real NEAR storage staking: 1e20 yoctoNEAR (0.1 NEAR) locked per byte.
