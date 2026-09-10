@@ -557,6 +557,7 @@ pub(crate) fn execute_tx(
 
     let module = MODULES
         .with(|m| m.borrow().as_ref().unwrap().get(contract_acct).cloned())
+        .or_else(|| fork_get_module(engine, contract_acct))
         .ok_or(format!(
             "contract account {} not in manifest",
             contract_acct
@@ -826,6 +827,7 @@ impl Default for RunCfg {
             trace: std::env::var("NEAR_MOCK_TRACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            fork: None,
         }
     }
 }
@@ -1503,10 +1505,7 @@ fn build_promise_hosts(
         &mut *store,
         FuncType::new(engine, vec![ValType::I64], vec![]),
         |mut caller, args, _| {
-            crate::near_mock::hosts::charge_gas(
-                &mut caller,
-                crate::near_mock::PROMISE_RETURN_GAS,
-            )?;
+            crate::near_mock::hosts::charge_gas(&mut caller, crate::near_mock::PROMISE_RETURN_GAS)?;
             PENDING_RETURN.with(|p| *p.borrow_mut() = Some(args[0].unwrap_i64() as usize));
             mtrace!("  → promise_return({})", args[0].unwrap_i64());
             Ok(())
@@ -2177,6 +2176,231 @@ pub(crate) fn run_scenario(path: &str) -> Result<(), Box<dyn std::error::Error>>
 // One JSON-RPC `query` via curl (no new deps; curl is guaranteed on macOS).
 // Err = the raw JSON-RPC error object, so callers can branch on error names
 // (e.g. TOO_LARGE_CONTRACT_STATE) and pull structured info (block hints).
+
+// ═══════════════════════════════════════════════════════════════════
+// Fork-mode: lazy code + state paging from an archival RPC ("anvil
+// --fork-url" for NEAR). Storage reads that miss locally page the key
+// in from the pinned block; contract code is fetched on first call.
+// Writes/deletes land locally; tombstones keep deletions from
+// resurrecting on later reads.
+// ═══════════════════════════════════════════════════════════════════
+
+thread_local! {
+    /// Prefixed keys known absent on the fork (fetched-miss or deleted
+    /// locally). Survives across txs within a session — a delete must not
+    /// resurrect via re-fetch. Not persisted with state files (session-scoped).
+    static FORK_ABSENT: std::cell::RefCell<std::collections::HashSet<Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Modules fetched+compiled at runtime (MODULES is Arc-frozen at install).
+    static FORK_MODULES: std::cell::RefCell<HashMap<String, wasmtime::Module>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Install fork config into RUN_CFG (library builder + CLI both use this).
+pub(crate) fn set_fork_cfg(rpc: String, block: u64) {
+    RUN_CFG.with(|c| {
+        let mut slot = c.borrow_mut();
+        let mut cfg = slot.take().unwrap_or_default();
+        cfg.fork = Some(crate::near_mock::gas::ForkCfg { rpc, block });
+        *slot = Some(cfg);
+    });
+}
+
+/// Latest block height from `status` (used when no --fork-block is given).
+pub(crate) fn fork_latest_block(rpc: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": "dontcare", "method": "status",
+        "params": [None::<String>]});
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2u64 << (attempt - 1)));
+        }
+        let out = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "30",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body.to_string(),
+                rpc,
+            ])
+            .output()
+            .map_err(|e| format!("curl spawn: {e}"))?;
+        if !out.status.success() {
+            last = format!("curl exit {}", out.status);
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            if let Some(h) = v
+                .pointer("/result/sync_info/latest_block_height")
+                .and_then(|x| x.as_u64())
+            {
+                return Ok(h);
+            }
+            last = v.to_string().chars().take(120).collect();
+        }
+    }
+    Err(format!("fork_latest_block failed: {last}").into())
+}
+
+pub(crate) fn fork_enabled() -> bool {
+    mock_cfg().fork.is_some()
+}
+
+/// Resolve a module for `account`: manifest first, then fork cache, then
+/// fetch code from the fork RPC + compile (instrumented).
+pub(crate) fn fork_get_module(
+    engine: &Rc<wasmtime::Engine>,
+    account: &str,
+) -> Option<wasmtime::Module> {
+    if let Some(m) = FORK_MODULES.with(|m| m.borrow().get(account).cloned()) {
+        return Some(m);
+    }
+    let cfg = mock_cfg().fork?;
+    let params = serde_json::json!({
+        "request_type": "view_code", "account_id": account, "block_id": cfg.block
+    });
+    let res = rpc_query(&cfg.rpc, params).ok()?;
+    let code_b64 = res.get("code_base64")?.as_str()?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(code_b64)
+        .ok()?;
+    let module = compile_module(engine, &bytes).ok()?;
+    FORK_MODULES.with(|m| {
+        m.borrow_mut().insert(account.to_string(), module.clone());
+    });
+    mtrace!(
+        "  🍴 fork: fetched+compiled {} bytes of code for {} @ block {}",
+        bytes.len(),
+        account,
+        cfg.block
+    );
+    Some(module)
+}
+
+/// Page in storage entries under `raw_key` prefix (usually the exact key)
+/// from the fork block. Returns true if the exact `prefixed` key now exists.
+/// Caller must NOT hold the state lock (this takes it to insert).
+pub(crate) fn fork_page_in(
+    state: &Arc<Mutex<MockState>>,
+    contract: &str,
+    raw_key: &[u8],
+    prefixed: &[u8],
+) -> bool {
+    let cfg = match mock_cfg().fork {
+        Some(c) => c,
+        None => return false,
+    };
+    if FORK_ABSENT.with(|a| a.borrow().contains(prefixed)) {
+        return false;
+    }
+    use base64::Engine;
+    let prefix_b64 = base64::engine::general_purpose::STANDARD.encode(raw_key);
+    // Unpaginated view_state refuses contracts whose TOTAL state is large
+    // (TOO_LARGE_CONTRACT_STATE — wrap.near, sweat, intents...). The
+    // paginated path (limit + after_key, current nearcore) has no such
+    // check: pages of ≤PAGE keys always serve. We fetch exact-key-prefix
+    // pages and follow the cursor while keys still extend the prefix.
+    let mut found_exact = false;
+    let mut fetched = 0usize;
+    let mut cursor: Option<Vec<u8>> = None;
+    for _page in 0..8 {
+        let mut params = serde_json::json!({
+            "request_type": "view_state", "account_id": contract,
+            "prefix_base64": prefix_b64, "block_id": cfg.block,
+            "limit": 100u32,
+        });
+        if let Some(after) = &cursor {
+            use base64::Engine;
+            params["after_key_base64"] =
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(after));
+        }
+        let res = match rpc_query(&cfg.rpc, params) {
+            Ok(r) => r,
+            Err(e) => {
+                mtrace!("  🍴 fork: view_state failed: {}", e);
+                return found_exact;
+            }
+        };
+        let values: Vec<(Vec<u8>, Vec<u8>)> = res
+            .get("values")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|entry| {
+                        let k = entry.get("key")?.as_str()?;
+                        let v = entry.get("value")?.as_str()?;
+                        let rk = base64::engine::general_purpose::STANDARD.decode(k).ok()?;
+                        let rv = base64::engine::general_purpose::STANDARD.decode(v).ok()?;
+                        Some((rk, rv))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if values.is_empty() {
+            break;
+        }
+        let page_len = values.len();
+        let last_key = values.last().map(|(k, _)| k.clone());
+        {
+            let mut st = state.lock().unwrap();
+            for (raw_k, val) in values {
+                let pk = prefixed_key(contract, &raw_k);
+                if pk == prefixed {
+                    found_exact = true;
+                }
+                st.storage.insert(pk, val);
+                fetched += 1;
+            }
+        }
+        // continue only while the page was full AND the last key extends the
+        // prefix (more may follow under the same prefix)
+        if page_len < 100 {
+            break;
+        }
+        match last_key {
+            Some(k) => cursor = Some(k),
+            None => break,
+        }
+    }
+    if !found_exact {
+        // negative cache (keys extending the prefix were cached anyway)
+        FORK_ABSENT.with(|a| {
+            a.borrow_mut().insert(prefixed.to_vec());
+        });
+    }
+    mtrace!(
+        "  🍴 fork: paged {} keys for {} [{}] @ {} — exact={}",
+        fetched,
+        contract,
+        crate::near_mock::hosts::dbg_key(raw_key),
+        cfg.block,
+        found_exact
+    );
+    found_exact
+}
+
+/// Record a local deletion so later reads don't resurrect it from the fork.
+pub(crate) fn fork_tombstone(prefixed: &[u8]) {
+    if fork_enabled() {
+        FORK_ABSENT.with(|a| {
+            a.borrow_mut().insert(prefixed.to_vec());
+        });
+    }
+}
+
+/// Clear a tombstone (a local write supersedes the chain's absence).
+pub(crate) fn fork_untombstone(prefixed: &[u8]) {
+    FORK_ABSENT.with(|a| {
+        a.borrow_mut().remove(prefixed);
+    });
+}
+
 fn rpc_query(rpc: &str, params: serde_json::Value) -> Result<serde_json::Value, serde_json::Value> {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": "dontcare", "method": "query", "params": params
@@ -2647,6 +2871,89 @@ fn run_state_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// near-mock fork — call a contract against real chain state, locally.
+//
+//   near-mock fork <account> <method> [args-json]
+//       [--url RPC] [--block H] [--signer S] [--deposit YOCTO] [--view]
+//
+// Code and storage are paged in lazily from the archival RPC at the pinned
+// block (latest if not given). Writes land locally; nothing is persisted
+// unless NEAR_MOCK_STATE is set.
+// ═══════════════════════════════════════════════════════════════════
+fn run_fork(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let usage = "usage: near-mock fork <account> <method> [args-json] \
+        [--url RPC] [--block H] [--signer S] [--deposit YOCTO] [--view]";
+    let flag = |name: &str| args.iter().position(|a| a == name);
+    let val = |name: &str| -> Option<String> { flag(name).and_then(|i| args.get(i + 1)).cloned() };
+    let account = args.get(2).ok_or(usage)?;
+    let method = args.get(3).ok_or(usage)?;
+    let args_json = args
+        .get(4)
+        .filter(|s| !s.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| "{}".into());
+    let rpc = val("--url").unwrap_or_else(|| "https://rpc.mainnet.fastnear.com".into());
+    let signer = val("--signer");
+    let deposit: u128 = val("--deposit").and_then(|d| d.parse().ok()).unwrap_or(0);
+    let is_view = flag("--view").is_some();
+
+    let block = match val("--block").and_then(|b| b.parse::<u64>().ok()) {
+        Some(b) => b,
+        None => {
+            let b = fork_latest_block(&rpc)?;
+            println!("🍴 fork: {} @ latest block {b}", account);
+            b
+        }
+    };
+    set_fork_cfg(rpc.clone(), block);
+
+    // The forked account is the default signer — its state is what we read.
+    let signer = signer.unwrap_or_else(|| account.clone());
+    let account_static: &str = Box::leak(account.clone().into_boxed_str());
+    let method_static: &str = Box::leak(method.clone().into_boxed_str());
+
+    let chain = MockChain::builder()
+        .fork(&rpc, Some(block))
+        .signer(&signer)
+        .build()?;
+    println!(
+        "▶ {account}.{method}({args_json}){}",
+        if is_view { " [view]" } else { "" }
+    );
+
+    let mut call = if is_view {
+        chain.view(account_static, method_static)
+    } else {
+        chain.call(account_static, method_static)
+    };
+    call = call.args(args_json).from(signer.clone());
+    if deposit > 0 {
+        call = call.attach(deposit);
+    }
+    let out = call.fire()?;
+
+    if out.ok {
+        println!("✅ Success");
+        if let Some(data) = &out.return_data {
+            match std::str::from_utf8(data) {
+                Ok(s) => println!("📄 {s}"),
+                Err(_) => println!("📄 <{} binary bytes>", data.len()),
+            }
+        }
+    } else {
+        println!("❌ {}", out.error.as_deref().unwrap_or("failed"));
+        if let Some(p) = &out.panic {
+            println!("   class: {p}");
+        }
+        std::process::exit(1);
+    }
+    for l in &out.logs {
+        println!("  LOG: {l}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if matches!(
@@ -2670,6 +2977,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `skill [--stdout|--force]` — install the AI-agent skill into this
     // project (.agents/skills/near-mock/). Embedded via include_str! —
     // self-contained binary, same pattern as near-compile 0.1.2.
+    if args.get(1).map(|s| s.as_str()) == Some("fork") {
+        return run_fork(&args);
+    }
     if args.get(1).map(|s| s.as_str()) == Some("skill") {
         const SKILL_MD: &str = include_str!("../../skills/SKILL.md");
         const SKILL_SCENARIO: &str = include_str!("../../skills/example-scenario.json");

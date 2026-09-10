@@ -217,11 +217,19 @@ pub(crate) fn sub_execute(
     predecessor: &str,
     deposit: u128,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    let module = MODULES.with(|m| {
-        m.borrow()
-            .as_ref()
-            .and_then(|map| map.get(account).cloned())
-    });
+    let module = MODULES
+        .with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|map| map.get(account).cloned())
+        })
+        // fork-mode: unknown account → page code in from the fork RPC
+        .or_else(|| {
+            let engine = ENGINE_TLS
+                .with(|e| e.borrow().clone())
+                .expect("ENGINE_TLS set");
+            crate::near_mock::fork_get_module(&engine, account)
+        });
     let Some(module) = module else {
         // 2026-09-02 live-caught (nostr-gov tk="nil"): unknown-account FnCall
         // receipts FAIL on-chain (AccountDoesNotExist). The old silent

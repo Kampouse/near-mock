@@ -185,6 +185,14 @@ impl GasSchedule {
     }
 }
 
+/// Fork-mode config: lazily page contract code + storage from an archival
+/// RPC at a pinned block ("anvil --fork-url" for NEAR).
+#[derive(Clone, Debug)]
+pub(crate) struct ForkCfg {
+    pub(crate) rpc: String,
+    pub(crate) block: u64,
+}
+
 /// Real NEAR storage staking: 1e20 yoctoNEAR (0.1 NEAR) locked per byte.
 pub(crate) const STAKING_COST_PER_BYTE: u128 = 100_000_000_000_000_000_000;
 
@@ -205,6 +213,8 @@ pub(crate) struct RunCfg {
     /// --trace | NEAR_MOCK_TRACE=1: record every host call (name, gas, seq)
     /// into HOST_TRACE and print a per-host summary after the run.
     pub(crate) trace: bool,
+    /// Fork-mode: lazy state/code paging from archival RPC.
+    pub(crate) fork: Option<ForkCfg>,
 }
 
 /// SplitMix64 — cheap mixing for the per-call random_seed entropy.

@@ -112,6 +112,10 @@ pub struct ChainBuilder {
     state_path: Option<String>,
     signer: String,
     now: Option<i64>,
+    /// Fork-mode: page code + state lazily from an archival RPC at a pinned
+    /// block ("anvil --fork-url" style). Contracts may be empty — code and
+    /// storage arrive on demand; local writes shadow the fork.
+    fork: Option<(String, Option<u64>)>,
 }
 
 impl Default for ChainBuilder {
@@ -122,6 +126,7 @@ impl Default for ChainBuilder {
             state_path: None,
             signer: "caller.test.near".into(),
             now: None,
+            fork: None,
         }
     }
 }
@@ -168,7 +173,22 @@ impl ChainBuilder {
         self
     }
 
+    /// Fork mainnet (or any chain) at a block: contract code and storage are
+    /// paged in lazily from `rpc` (archival) at `block` (None = latest).
+    /// Local calls execute against that state; writes shadow it.
+    pub fn fork(mut self, rpc: &str, block: Option<u64>) -> Self {
+        self.fork = Some((rpc.to_string(), block));
+        self
+    }
+
     pub fn build(self) -> Result<MockChain, Box<dyn std::error::Error>> {
+        if let Some((rpc, block)) = &self.fork {
+            let block = match block {
+                Some(b) => *b,
+                None => crate::near_mock::fork_latest_block(rpc)?,
+            };
+            crate::near_mock::set_fork_cfg(rpc.clone(), block);
+        }
         let engine = std::rc::Rc::new(wasmtime::Engine::new(&crate::near_mock::base_engine_config())?);
 
         let mut modules = std::collections::HashMap::new();

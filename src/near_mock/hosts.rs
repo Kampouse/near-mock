@@ -12,7 +12,7 @@ use wasmtime::*;
 /// Debug-escape a raw trie key for trace output: printable ASCII as-is,
 /// everything else as \xNN so borsh prefixes and account separators stay
 /// legible (e.g. "\x04\x0ftoken.chat.near").
-fn dbg_key(k: &[u8]) -> String {
+pub(crate) fn dbg_key(k: &[u8]) -> String {
     let mut s = String::with_capacity(k.len() + 2);
     for &b in k {
         if (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' {
@@ -312,7 +312,8 @@ pub(crate) fn build_env_linker(
                     let mut st = s6.lock().unwrap();
                     let trie = trie_charge_write(&mut st, &key);
                     let (klen, vlen) = (key.len(), val.len());
-                    let old = st.storage.insert(key, val);
+                    let old = st.storage.insert(key.clone(), val);
+                    crate::near_mock::fork_untombstone(&key);
                     evicted = old.is_some();
                     // Storage staking: lock for net new bytes (refund replaced).
                     // Prefixed key = acct + '\0' + raw key → raw key = klen - acct - 1.
@@ -406,6 +407,40 @@ pub(crate) fn build_env_linker(
                     let mut st = s7.lock().unwrap();
                     write_reg_checked(&mut st, rid, val).map_err(|e| wasmtime::Error::msg(e))?;
                     true
+                } else if crate::near_mock::fork_enabled() {
+                    // fork-mode: local miss → page the key in from the fork
+                    // block, then re-check (found path re-runs below by
+                    // re-locking; keep it simple: recursive-free re-lookup)
+                    drop(st);
+                    let contract = exec_ctx_or_default().contract;
+                    let raw = &key[contract.len() + 1..];
+                    let hit = crate::near_mock::fork_page_in(&s7, &contract, raw, key);
+                    if hit {
+                        let val = {
+                            let mut st = s7.lock().unwrap();
+                            let v = st.storage.get(key).cloned();
+                            let trie = trie_charge(&mut st, key);
+                            let gas = &mock_cfg().gas;
+                            let cost = gas.storage_read_base
+                                + gas.storage_read_key_byte * kl as u64
+                                + gas.storage_read_value_byte * v.as_ref().map(|x| x.len()).unwrap_or(0) as u64
+                                + trie
+                                + crate::near_mock::READ_MEMORY_BASE_GAS + crate::near_mock::READ_MEMORY_BYTE_GAS * kl as u64
+                                + crate::near_mock::WRITE_REGISTER_BASE_GAS
+                                + crate::near_mock::WRITE_REGISTER_BYTE_GAS * v.as_ref().map(|x| x.len()).unwrap_or(0) as u64;
+                            drop(st);
+                            charge_gas(&mut caller, cost)?;
+                            v
+                        };
+                        if let Some(val) = val {
+                            let mut st = s7.lock().unwrap();
+                            write_reg_checked(&mut st, rid, val)
+                                .map_err(|e| wasmtime::Error::msg(e))?;
+                        }
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     htrace!(
                         "  → storage_read not found [{}]",
@@ -479,6 +514,7 @@ pub(crate) fn build_env_linker(
                             write_reg_checked(&mut st, rid, val)
                                 .map_err(|e| wasmtime::Error::msg(e))?;
                         }
+                        crate::near_mock::fork_tombstone(&rkey);
                         results[0] = Val::I64(1);
                         return Ok(());
                     }
@@ -504,10 +540,15 @@ pub(crate) fn build_env_linker(
                         let acct = exec_ctx_or_default().contract;
                         prefixed_key(&acct, &raw)
                     };
-                    let (has, trie) = {
+                    let (mut has, trie) = {
                         let mut st = s9.lock().unwrap();
                         (st.storage.contains_key(&hkey), trie_charge(&mut st, &hkey))
                     };
+                    if !has && crate::near_mock::fork_enabled() {
+                        let contract = exec_ctx_or_default().contract;
+                        let raw = &hkey[contract.len() + 1..];
+                        has = crate::near_mock::fork_page_in(&s9, &contract, raw, &hkey);
+                    }
                     // PV155 composite: read_memory(key) + storage_has_key + trie
                     let gas = &mock_cfg().gas;
                     let cost = gas.storage_has_key_base

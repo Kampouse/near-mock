@@ -158,3 +158,31 @@ drain loop in long-running processes).
 Known calibration gap: trie-node charges use a flat walk model (mainnet's scale
 with real trie/proof size) — measured ~0.6x on 10+ GB contracts, ~0.9x+ on
 small ones.
+
+## Fork-mode — real chain state, locally
+
+```bash
+near-mock fork <account> <method> [args-json] [--url RPC] [--block H] [--signer S] [--deposit YOCTO] [--view]
+```
+
+Or in code:
+
+```rust
+let chain = MockChain::builder()
+    .fork("https://rpc.mainnet.fastnear.com", Some(123_456_789))
+    .build()?;
+let out = chain.view("omft.near", "acl_is_super_admin")
+    .args(r#"{"account_id":"omft.near"}"#)
+    .fire()?;
+```
+
+Contract code (`view_code`) and storage (`view_state`) are paged in lazily
+at a pinned block; writes land locally (tombstones keep deletions from
+resurrecting). Validated byte-identical to RPC's own view execution
+(`tests/fork.rs --ignored`).
+
+**No state-size limit**: unpaginated `view_state` refuses large contracts
+(`TOO_LARGE_CONTRACT_STATE`), but the paginated path (`limit` +
+`after_key_base64`) has no such check — fork-mode pages through it.
+Validated byte-identical on the biggest contracts on mainnet (wrap.near
+158MB, token.sweat, intents.near 11.7GB).
