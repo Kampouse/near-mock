@@ -62,11 +62,21 @@ pub struct CallOutcome {
     pub entry_trapped: bool,
     /// Error text (trap message / chain failure) when `!ok`.
     pub error: Option<String>,
+    /// Normalized guest panic ("Smart contract panicked: <msg>", nearcore
+    /// ExecutionError format) when the failure is a guest panic — comparable
+    /// against mainnet receipt failures. `error` keeps the raw blob.
+    pub panic: Option<String>,
+    /// Normalized guest panics from PROMISE receipts of this tx (execution
+    /// order). Compare against mainnet's same-tx receipt-subtree failures.
+    pub receipt_failures: Vec<String>,
     /// Fire-and-forget receipts that failed (parent tx still commits).
     pub orphan_failures: usize,
     /// Gas burned by the entry call (PV155 units; 1e12 = 1 TGas). Receipt
     /// gas burns in per-receipt stores and is not included.
     pub gas_burned: u64,
+    /// Raw log lines emitted during this tx (byte-exact, no debug suffixes).
+    /// NEP-297 events are the `EVENT_JSON:`-prefixed entries.
+    pub logs: Vec<String>,
 }
 
 impl From<TxOutcome> for CallOutcome {
@@ -77,8 +87,11 @@ impl From<TxOutcome> for CallOutcome {
             receipt_results: o.receipt_results,
             entry_trapped: o.entry_trapped,
             error: o.error,
+            panic: o.panic,
+            receipt_failures: o.receipt_failures,
             orphan_failures: o.orphan_failures,
             gas_burned: o.entry_gas_burned,
+            logs: o.logs,
         }
     }
 }
@@ -156,15 +169,11 @@ impl ChainBuilder {
     }
 
     pub fn build(self) -> Result<MockChain, Box<dyn std::error::Error>> {
-        let mut fuel_cfg = wasmtime::Config::new();
-        fuel_cfg.consume_fuel(true);
-        fuel_cfg.max_wasm_stack(64 * 1024 * 1024);
-        fuel_cfg.async_stack_size(64 * 1024 * 1024);
-        let engine = std::rc::Rc::new(wasmtime::Engine::new(&fuel_cfg)?);
+        let engine = std::rc::Rc::new(wasmtime::Engine::new(&crate::near_mock::base_engine_config())?);
 
         let mut modules = std::collections::HashMap::new();
         for (acct, bytes) in &self.contracts {
-            modules.insert(acct.clone(), wasmtime::Module::from_binary(&engine, bytes)?);
+            modules.insert(acct.clone(), crate::near_mock::compile_module(&engine, bytes)?);
         }
 
         let storage: std::collections::HashMap<Vec<u8>, Vec<u8>> = match &self.state_path {
@@ -218,6 +227,7 @@ impl MockChain {
             contract,
             method,
             args: "{}".into(),
+            args_raw: None,
             signer: self.signer.clone(),
             attach: 0,
             view: false,
@@ -267,6 +277,9 @@ pub struct CallBuilder {
     contract: &'static str,
     method: &'static str,
     args: String,
+    /// Verbatim args (borsh/binary contracts like the aurora engine).
+    /// Takes precedence over `args` when set.
+    args_raw: Option<Vec<u8>>,
     signer: String,
     attach: u128,
     view: bool,
@@ -277,6 +290,13 @@ impl CallBuilder {
     /// JSON method args (default `{}`).
     pub fn args(mut self, json: impl Into<String>) -> Self {
         self.args = json.into();
+        self
+    }
+
+    /// Raw method args — verbatim bytes (binary/borsh contracts). Overrides
+    /// any `.args()` JSON. Replay fidelity: byte-exact mainnet args.
+    pub fn args_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.args_raw = Some(bytes);
         self
     }
 
@@ -316,7 +336,7 @@ impl CallBuilder {
             &state,
             self.contract,
             self.method,
-            &self.args,
+            self.args_raw.as_deref().unwrap_or(self.args.as_bytes()),
             &self.signer,
             self.attach,
             &self.fail_receipts,

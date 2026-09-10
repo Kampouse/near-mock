@@ -60,8 +60,15 @@ pub(crate) struct MockState {
 }
 
 pub(crate) fn write_reg_checked(st: &mut MockState, rid: u64, data: Vec<u8>) -> Result<(), String> {
+    // Mainnet VM limits (protocol-86 parameters snapshot, parity audit
+    // 2026-09-10): max_register_size = 100 MiB, registers_memory_limit =
+    // 1 GiB across all registers, max_number_registers = 100 — including the
+    // nearcore quirk that at exactly 100 registers even REPLACING an existing
+    // one fails. The old 1 MiB cap rejected mainnet-legal inputs (aurora's
+    // multi-MiB submit args land in a register via input()).
     const MAX_REGS: usize = 100;
-    const MAX_REG_SIZE: usize = 1 << 20;
+    const MAX_REG_SIZE: usize = 104_857_600;
+    const REGISTERS_MEMORY_LIMIT: usize = 1_073_741_824;
     if data.len() > MAX_REG_SIZE {
         return Err(format!(
             "MemoryAccessViolation: register {} value {}b exceeds max {}b",
@@ -74,6 +81,21 @@ pub(crate) fn write_reg_checked(st: &mut MockState, rid: u64, data: Vec<u8>) -> 
         return Err(format!(
             "MemoryAccessViolation: register limit {} exceeded",
             MAX_REGS
+        ));
+    }
+    // total memory across registers (a replacement frees the old entry first)
+    let freed = st.registers.get(&rid).map_or(0, |v| v.len());
+    let new_total = st
+        .registers
+        .values()
+        .map(|v| v.len())
+        .sum::<usize>()
+        .saturating_sub(freed)
+        .saturating_add(data.len());
+    if new_total > REGISTERS_MEMORY_LIMIT {
+        return Err(format!(
+            "MemoryAccessViolation: registers memory limit {} exceeded",
+            REGISTERS_MEMORY_LIMIT
         ));
     }
     st.registers.insert(rid, data);

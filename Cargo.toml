@@ -1,6 +1,6 @@
 [package]
 name = "near-mock"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 description = "Local NEAR contract runner — real contracts, real hosts, deterministic, no node"
 license = "MIT"
@@ -27,6 +27,8 @@ sha2 = "0.10"
 sha3 = "0.10"
 tiny-keccak = { version = "2", features = ["keccak"] }
 ripemd = "0.1"
+finite-wasm = { version = "0.6.1", features = ["instrument"] }
+wasmparser = "0.248"
 
 [dev-dependencies]
 tempfile = "3"

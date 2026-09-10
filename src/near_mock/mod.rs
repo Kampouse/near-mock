@@ -33,6 +33,80 @@ pub(crate) use gas::{
     GasSchedule, RunCfg,
 };
 pub(crate) use hosts::{build_env_linker, host_fn};
+
+// ── mainnet gas/stack instrumentation (finite-wasm, PV155 costs) ──
+pub(crate) mod instrument;
+pub(crate) use instrument::REMAINING_GAS_EXPORT;
+
+/// PV155 instruction costs (protocol-86 parameter snapshot, 2026-09-10).
+pub(crate) const REGULAR_OP_COST: u64 = 822_756;
+pub(crate) const LINEAR_OP_BASE_COST: u64 = 26_328_192;
+pub(crate) const LINEAR_OP_UNIT_COST: u64 = 822_756;
+/// max_stack_height (protocol-86): enforced by the instrumented stack budget.
+pub(crate) const MAX_STACK_HEIGHT: u32 = 262_144;
+/// Function-call action fee (execution side, protocol-86): burned by the
+/// receipt itself on mainnet, on top of instruction + host gas.
+pub(crate) const FUNCTION_CALL_BASE_GAS: u64 = 780_000_000_000;
+pub(crate) const FUNCTION_CALL_BYTE_GAS: u64 = 2_235_934;
+/// PV155 `base`: charged for EVERY host-function invocation.
+pub(crate) const HOST_CALL_BASE_GAS: u64 = 264_768_111;
+/// PV155 action-receipt creation fee (execution side) — every action receipt
+/// burns this when applied, on top of per-action costs.
+pub(crate) const ACTION_RECEIPT_CREATION_GAS: u64 = 108_059_500_000;
+/// PV155 register/memory host costs (protocol-86 snapshot). The old
+/// hardcoded numbers were ~100-275x low on bases — every receipt pays
+/// input()/register costs, so this skewed ALL receipts slightly.
+pub(crate) const WRITE_REGISTER_BASE_GAS: u64 = 2_865_522_486;
+pub(crate) const WRITE_REGISTER_BYTE_GAS: u64 = 3_801_564;
+pub(crate) const READ_MEMORY_BASE_GAS: u64 = 2_609_863_200;
+pub(crate) const READ_MEMORY_BYTE_GAS: u64 = 3_801_333;
+pub(crate) const WRITE_MEMORY_BASE_GAS: u64 = 2_803_794_861;
+pub(crate) const WRITE_MEMORY_BYTE_GAS: u64 = 2_723_772;
+pub(crate) const SHA256_BASE_GAS: u64 = 4_540_970_250;
+pub(crate) const SHA256_BYTE_GAS: u64 = 24_117_351;
+pub(crate) const KECCAK256_BASE_GAS: u64 = 5_879_491_275;
+pub(crate) const KECCAK256_BYTE_GAS: u64 = 21_471_105;
+pub(crate) const KECCAK512_BASE_GAS: u64 = 5_811_388_236;
+pub(crate) const KECCAK512_BYTE_GAS: u64 = 36_649_701;
+/// PV155 decoding + register costs (protocol-86).
+pub(crate) const UTF8_DECODING_BASE_GAS: u64 = 3_111_779_061;
+pub(crate) const UTF8_DECODING_BYTE_GAS: u64 = 291_580_479;
+pub(crate) const UTF16_DECODING_BASE_GAS: u64 = 3_543_313_050;
+pub(crate) const UTF16_DECODING_BYTE_GAS: u64 = 163_577_493;
+pub(crate) const READ_REGISTER_BASE_GAS: u64 = 2_517_165_186;
+/// PV155 promise host costs.
+pub(crate) const PROMISE_AND_BASE_GAS: u64 = 1_465_013_400;
+pub(crate) const PROMISE_AND_PER_GAS: u64 = 5_452_176;
+pub(crate) const PROMISE_RETURN_GAS: u64 = 560_152_386;
+
+/// Burn gas from an instance's instrumented remaining_gas global.
+/// Returns the new remaining value.
+pub(crate) fn burn_gas_global(
+    store: &mut wasmtime::Store<StoreData>,
+    instance: &wasmtime::Instance,
+    amount: u64,
+) -> u64 {
+    let Some(g) = instance.get_global(&mut *store, REMAINING_GAS_EXPORT) else {
+        return 0;
+    };
+    let cur = match g.get(&mut *store) {
+        wasmtime::Val::I64(v) => u64::try_from(v).unwrap_or(0),
+        _ => return 0,
+    };
+    let next = cur.saturating_sub(amount);
+    let _ = g.set(&mut *store, wasmtime::Val::I64(next as i64));
+    next
+}
+
+/// Compile a contract mainnet-style: finite-wasm gas+stack instrumentation,
+/// then wasmtime compilation. Every module loading path uses this.
+pub(crate) fn compile_module(
+    engine: &wasmtime::Engine,
+    bytes: &[u8],
+) -> Result<wasmtime::Module, Box<dyn std::error::Error>> {
+    let prepared = instrument::instrument(bytes)?;
+    Ok(wasmtime::Module::from_binary(engine, &prepared)?)
+}
 pub(crate) use promises::{
     dag_push, execute_promise, fail_receipts_any, fail_receipts_set, print_dag_map, sub_execute,
     PAction, PromiseBatch,
@@ -191,11 +265,7 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or_else(|| "{}".into());
 
-    let mut fuel_cfg = Config::new();
-    fuel_cfg.consume_fuel(true);
-    fuel_cfg.max_wasm_stack(64 * 1024 * 1024);
-    fuel_cfg.async_stack_size(64 * 1024 * 1024);
-    let engine = Rc::new(wasmtime::Engine::new(&fuel_cfg)?);
+    let engine = Rc::new(wasmtime::Engine::new(&base_engine_config())?);
 
     let state = init_sandbox(engine.clone(), manifest, state_path, run_view)?;
     // Pre-tx storage copy for the --json diff (execute_tx keeps its own
@@ -221,7 +291,7 @@ fn run_cross(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &state,
         contract_acct,
         method,
-        &args_json,
+        args_json.as_bytes(),
         &signer,
         attach,
         &fail_receipts,
@@ -366,33 +436,34 @@ pub(crate) struct TxOutcome {
     pub entry_trapped: bool,
     /// Error text for the failure case (trap message / chain failure).
     pub error: Option<String>,
+    /// Normalized panic message when the failure is a guest panic — exact
+    /// nearcore ExecutionError format ("Smart contract panicked: <msg>"),
+    /// extracted from the wasmtime error chain's `PANIC:` line. Lets library
+    /// differs compare failure CLASSES against mainnet directly; `error`
+    /// keeps the raw backtrace for debugging.
+    pub panic: Option<String>,
+    /// Normalized guest panics from PROMISE receipts of this tx, execution
+    /// order ("Smart contract panicked: <msg>"). Empty when nothing trapped
+    /// or the entry trapped before creating promises.
+    pub receipt_failures: Vec<String>,
     /// Fire-and-forget receipts that failed (parent tx still commits).
     pub orphan_failures: usize,
     /// Gas burned by the ENTRY call (wasmtime fuel; PV155 1:1). Receipt gas
     /// burns in per-receipt stores and is not included here.
     pub entry_gas_burned: u64,
+    /// Raw log lines emitted during this tx (byte-exact, no debug suffixes).
+    pub logs: Vec<String>,
 }
 
-pub(crate) fn execute_tx(
-    engine: &Rc<wasmtime::Engine>,
-    state: &Arc<Mutex<MockState>>,
-    contract_acct: &str,
-    method: &str,
-    args_json: &str,
-    signer: &str,
-    attach: u128,
-    fail_receipts: &[usize],
-    view: bool,
-) -> Result<TxOutcome, Box<dyn std::error::Error>> {
-    // Always set (not only when non-empty): a previous call on this thread
-    // must not leak its forced-failure receipt indices into this one.
-    fail_receipts_set(fail_receipts);
-    // Fresh-tx hygiene (issue #1 L1): a previous call on this thread must not
-    // leak return_data, registers, or promise state into this one. Receipt
-    // execution clears+restores around sub-calls; the entry call relied on
-    // fresh processes (CLI) or per-step resets (scenario runner) — the
-    // MockChain library path had neither, so call #2 saw call #1's data.
-    {
+/// Fresh-tx hygiene (issue #1 L1): a previous call on this thread must not
+/// leak its return_data, registers, or promise state into this one. Receipt
+/// execution clears+restores around sub-calls; the entry call relied on
+/// fresh processes (CLI) or per-step resets (scenario runner) — the
+/// MockChain library path had neither, so call #2 saw call #1's data.
+pub(crate) fn fresh_tx_state() {
+    // Unit tests exercise the promise engine without an installed sandbox —
+    // the state-scoped clears are simply skipped there.
+    if let Some(state) = state_arc_tls() {
         let mut st = state.lock().unwrap();
         st.return_data = None;
         st.registers.clear();
@@ -401,6 +472,73 @@ pub(crate) fn execute_tx(
     EXECUTED_PROMISES.with(|e| e.borrow_mut().clear());
     PROMISE_RESULTS.with(|r| *r.borrow_mut() = Vec::new());
     PENDING_RETURN.with(|p| *p.borrow_mut() = None);
+    LOG_LINES.with(|l| l.borrow_mut().clear());
+    crate::near_mock::promises::receipt_traps_reset();
+    // Execute-once memo is PER-DAG scope: indices restart at 0 every tx
+    // (PROMISE_DAG cleared above), so an entry surviving from a previous tx
+    // would alias THIS tx's receipt 0 — replaying stale results and skipping
+    // the EXECUTED_PROMISES mark, which sent the orphan-drain loop into an
+    // infinite spin (live-caught 2026-09-10: omft deposit flood, replayer
+    // hung). Clearing restores the within-one-DAG memoization semantics.
+    PROMISE_OUTCOMES.with(|o| o.borrow_mut().clear());
+}
+
+/// Store data for every execution: mainnet's instance/table/memory limits
+/// (parameters snapshot, protocol 86: max 2048 memory pages = 128 MiB,
+/// 1 table of ≤10k elements). Without a limiter the mock allowed memory to
+/// grow to the full 4 GiB wasm ceiling where mainnet traps — found by the
+/// wasmtime parity audit 2026-09-10.
+pub(crate) type StoreData = wasmtime::StoreLimits;
+
+pub(crate) const MAX_MEMORY_PAGES: u64 = 2048;
+
+/// New store with mainnet resource limits installed.
+pub(crate) fn new_store(engine: &wasmtime::Engine) -> wasmtime::Store<StoreData> {
+    let limits = wasmtime::StoreLimitsBuilder::new()
+        .instances(1)
+        .memories(1)
+        .memory_size((MAX_MEMORY_PAGES * 65536) as usize)
+        .tables(1)
+        .table_elements(10_000)
+        .build();
+    let mut store = wasmtime::Store::new(engine, limits);
+    store.limiter(|l| l);
+    store
+}
+
+/// Engine config shared by every entry point (library, CLI, cross, scenario).
+/// Parity audit 2026-09-10 vs nearcore wasmtime_runner:
+/// - NaN canonicalization ON — mainnet sets it (they ship a test asserting
+///   canonical NaN payloads); wasmtime default is OFF, so float bit patterns
+///   diverged silently.
+/// - max_wasm_stack stays 64 MiB (mock's own headroom; mainnet uses 1 GiB
+///   wasmtime headroom + a 262_144-frame instrumented limit we don't model).
+pub(crate) fn base_engine_config() -> wasmtime::Config {
+    let mut cfg = wasmtime::Config::new();
+    // Fuel is OFF: gas is metered by finite-wasm instrumentation into the
+    // remaining_gas global (mainnet mechanism), charged per-op with PV155
+    // costs. Fuel previously double-counted with different weights.
+    cfg.cranelift_nan_canonicalization(true);
+    cfg.max_wasm_stack(64 * 1024 * 1024);
+    cfg.async_stack_size(64 * 1024 * 1024);
+    cfg
+}
+
+pub(crate) fn execute_tx(
+    engine: &Rc<wasmtime::Engine>,
+    state: &Arc<Mutex<MockState>>,
+    contract_acct: &str,
+    method: &str,
+    args: &[u8],
+    signer: &str,
+    attach: u128,
+    fail_receipts: &[usize],
+    view: bool,
+) -> Result<TxOutcome, Box<dyn std::error::Error>> {
+    // Always set (not only when non-empty): a previous call on this thread
+    // must not leak its forced-failure receipt indices into this one.
+    fail_receipts_set(fail_receipts);
+    fresh_tx_state();
     // The ENTRY receipt's deposit: attached_deposit() inside the contract
     // reads CURRENT_DEPOSIT (promise children get theirs from sub_execute).
     // Before 0.1.7 the cross/call path credited the balance but left the
@@ -409,7 +547,7 @@ pub(crate) fn execute_tx(
     CURRENT_DEPOSIT.with(|d| *d.borrow_mut() = Some(attach));
     EXEC_CTX.with(|c| {
         *c.borrow_mut() = Some(ExecCtx {
-            input: args_json.as_bytes().to_vec(),
+            input: args.to_vec(),
             signer: signer.to_string(),
             predecessor: signer.to_string(),
             contract: contract_acct.to_string(),
@@ -430,15 +568,30 @@ pub(crate) fn execute_tx(
         credit_attach(state, contract_acct, attach)?;
     }
 
-    let mut store = wasmtime::Store::new(&**engine, ());
-    store.set_fuel(PREPAID_FUEL.with(|f| *f.borrow()))?;
-    let linker = build_env_linker(
-        &mut store,
-        &**engine,
-        state.clone(),
-        args_json.as_bytes().to_vec(),
-    )?;
+    let mut store = new_store(&**engine);
+    let prepaid = PREPAID_FUEL.with(|f| *f.borrow());
+    let linker = build_env_linker(&mut store, &**engine, state.clone(), args.to_vec())?;
     let instance = linker.instantiate(&mut store, &module)?;
+
+    // Gas budget lands in the instrumented global (fuel is disabled). Also
+    // invoke the module's start function (exported, not a start section, per
+    // nearcore prepare) BEFORE the entry — it's instrumented and charged.
+    if let Some(g) = instance.get_global(&mut store, crate::near_mock::REMAINING_GAS_EXPORT) {
+        g.set(&mut store, wasmtime::Val::I64(prepaid as i64)).ok();
+    }
+    if let Some(start) = instance.get_func(&mut store, "start") {
+        let _ = start.call(&mut store, &[], &mut []);
+    }
+    // Function-call action fee (execution side) — burned by the receipt on
+    // mainnet before the contract runs; without it the differ's gas axis
+    // would read ~0.8 Tgas systematically low.
+    crate::near_mock::burn_gas_global(
+        &mut store,
+        &instance,
+        crate::near_mock::ACTION_RECEIPT_CREATION_GAS
+            + crate::near_mock::FUNCTION_CALL_BASE_GAS
+            + crate::near_mock::FUNCTION_CALL_BYTE_GAS * args.len() as u64,
+    );
 
     let func = instance
         .get_func(&mut store, method)
@@ -456,12 +609,16 @@ pub(crate) fn execute_tx(
         receipt_results: Vec::new(),
         entry_trapped: false,
         error: None,
+        panic: None,
+        receipt_failures: Vec::new(),
         orphan_failures: 0,
         entry_gas_burned: 0,
+        logs: Vec::new(),
     };
     if result.is_err() {
         outcome.entry_trapped = true;
         outcome.error = Some(result.as_ref().err().unwrap().to_string());
+        outcome.panic = extract_panic(&error_chain(result.as_ref().err().unwrap()));
         // entry failed: snapshot WITHOUT the attach credit → full refund
         if attach > 0 {
             let key = prefixed_key(contract_acct, b"\x00near-bal");
@@ -536,13 +693,65 @@ pub(crate) fn execute_tx(
             st.storage = tx_snapshot;
         }
     }
-    outcome.entry_gas_burned = PREPAID_FUEL
-        .with(|f| *f.borrow())
-        .saturating_sub(store.get_fuel().unwrap_or(u64::MAX));
+    outcome.entry_gas_burned = {
+        // burned = prepaid - remaining, from the instrumented gas global
+        let remaining = instance
+            .get_global(&mut store, crate::near_mock::REMAINING_GAS_EXPORT)
+            .map(|g| match g.get(&mut store) {
+                wasmtime::Val::I64(v) => u64::try_from(v).unwrap_or(0),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        prepaid.saturating_sub(remaining)
+    };
+    // Receipt-chain failures carry nested guest panics too — normalize once
+    // more so every !ok outcome has its class extracted if present.
+    if !outcome.ok && outcome.panic.is_none() {
+        if let Some(e) = outcome.error.as_deref() {
+            outcome.panic = extract_panic(e);
+        }
+    }
+    outcome.logs = LOG_LINES.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    outcome.receipt_failures = crate::near_mock::promises::receipt_traps_drain();
     // Receipt hygiene: don't leak the entry's deposit into the next tx on
     // this thread (the library MockChain path runs many calls in-process).
     CURRENT_DEPOSIT.with(|d| *d.borrow_mut() = None);
     Ok(outcome)
+}
+
+/// Pull the guest panic message out of a wasmtime error blob. The host's
+/// `panic_utf8` error ("PANIC: <msg>") rides the error chain below the
+/// backtrace; the message is the first line after the marker.
+fn extract_panic(raw: &str) -> Option<String> {
+    // Gas exhaustion: the instrumented hook errors with mainnet's receipt-
+    // level message — surface it as the failure CLASS directly (mainnet
+    // outcomes show ExecutionError "Exceeded the prepaid gas").
+    if raw.contains("Exceeded the prepaid gas") {
+        return Some("Exceeded the prepaid gas".to_string());
+    }
+    if raw.contains("WasmTrap: StackOverflow") {
+        return Some("WasmTrap: StackOverflow".to_string());
+    }
+    let i = raw.find("PANIC: ")?;
+    let rest = &raw[i + "PANIC: ".len()..];
+    let line = rest.lines().next().unwrap_or("").trim_end();
+    if line.is_empty() {
+        return None;
+    }
+    Some(format!("Smart contract panicked: {line}"))
+}
+
+/// Full error text INCLUDING the source chain — wasmtime::Error's Display
+/// shows only the outer message (backtrace header); root host errors
+/// ("PANIC: ...", ProhibitedInView, ...) live in the chain links the CLI
+/// walks via `e.chain().skip(1)`. wasmtime::Error doesn't impl std Error.
+fn error_chain(e: &wasmtime::Error) -> String {
+    let mut s = e.to_string();
+    for c in e.chain().skip(1) {
+        s.push('\n');
+        s.push_str(&c.to_string());
+    }
+    s
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -767,12 +976,37 @@ thread_local! {
     /// Event JSON strings (NEP-297 EVENT_JSON: logs), for --json output.
     static JSON_EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     static LOG_COUNT: std::cell::RefCell<usize> = const { std::cell::RefCell::new(0) };
+    /// Raw log lines of the CURRENT tx (cleared per execute_tx) — byte-exact,
+    /// no debug suffixes. Surfaces as TxOutcome.logs so library callers
+    /// (replayers, differs) don't scrape stdout. CLI printing unaffected.
+    static LOG_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// NEAR_MOCK_QUIET=1: suppress per-log println + hosts.rs per-call stderr
+/// traces (long-running replayers); capture into LOG_LINES still happens.
+/// Cached — checked per log line / host call.
+fn log_capture_quiet() -> bool {
+    static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| {
+        std::env::var("NEAR_MOCK_QUIET")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Shared gate for hosts.rs `htrace!` macro (same env var).
+pub(crate) fn host_trace_quiet() -> bool {
+    log_capture_quiet()
 }
 
 /// Route one decoded log line: NEP-297 EVENT_JSON: gets structured decoding,
 /// everything else prints as LOG. Never panics on weird payloads.
 fn handle_log_line(msg: &str, debug: bool, suffix: &str) {
     LOG_COUNT.with(|c| *c.borrow_mut() += 1);
+    LOG_LINES.with(|l| l.borrow_mut().push(msg.to_string()));
+    if log_capture_quiet() {
+        return; // still captured above; just don't print
+    }
     if let Some(rest) = msg.strip_prefix("EVENT_JSON:") {
         match serde_json::from_str::<serde_json::Value>(rest) {
             Ok(v) => {
@@ -792,13 +1026,22 @@ fn handle_log_line(msg: &str, debug: bool, suffix: &str) {
     }
 }
 
+/// Gated stderr trace (mod.rs library paths: promise hosts, attach credits,
+/// DAG resolution). NEAR_MOCK_QUIET=1 silences per-receipt firehose; the CLI
+/// default (no env) is unchanged.
+macro_rules! mtrace {
+    ($($arg:tt)*) => {
+        if !log_capture_quiet() { eprintln!($($arg)*); }
+    };
+}
+
 /// Run a pretty-printing section with panic containment: a reporting bug must
 /// never eat a successful run (the 2026-09-05 storage-dump char-boundary
 /// panic turned ✅ contract successes into exit 101).
 fn safe_report<F: FnOnce()>(label: &str, f: F) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     if r.is_err() {
-        eprintln!("⚠ {label}: reporting section panicked (contract result unaffected)");
+        mtrace!("⚠ {label}: reporting section panicked (contract result unaffected)");
     }
 }
 
@@ -814,7 +1057,11 @@ thread_local! {
 }
 
 // ── real promise hosts (cross engine) ──
-fn mem_read_str(caller: &mut wasmtime::Caller<'_, ()>, len: i64, ptr: i64) -> Option<String> {
+fn mem_read_str(
+    caller: &mut wasmtime::Caller<'_, StoreData>,
+    len: i64,
+    ptr: i64,
+) -> Option<String> {
     let len = len as usize;
     let ptr = ptr as usize;
     if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
@@ -829,7 +1076,11 @@ fn mem_read_str(caller: &mut wasmtime::Caller<'_, ()>, len: i64, ptr: i64) -> Op
 /// Read `mem[ptr..ptr+len]` from guest memory, or None on OOB. Mock
 /// equivalent of nearcore's `get_memory_or_register!` (which traps with
 /// MemoryAccessViolation when ptr+len exceeds memory).
-fn read_guest_bytes(caller: &mut wasmtime::Caller<'_, ()>, len: i64, ptr: i64) -> Option<Vec<u8>> {
+fn read_guest_bytes(
+    caller: &mut wasmtime::Caller<'_, StoreData>,
+    len: i64,
+    ptr: i64,
+) -> Option<Vec<u8>> {
     let (len, ptr) = (len as usize, ptr as usize);
     if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
         let md = mem.data(&caller);
@@ -842,7 +1093,7 @@ fn read_guest_bytes(caller: &mut wasmtime::Caller<'_, ()>, len: i64, ptr: i64) -
 
 #[allow(clippy::type_complexity)]
 fn build_promise_hosts(
-    store: &mut wasmtime::Store<()>,
+    store: &mut wasmtime::Store<StoreData>,
     engine: &wasmtime::Engine,
 ) -> Result<
     (
@@ -867,9 +1118,15 @@ fn build_promise_hosts(
         &mut *store,
         FuncType::new(engine, vec![ValType::I64; 2], vec![ValType::I64]),
         move |mut caller, args, results| {
+            let acct_len = args[0].unwrap_i64() as u64 as u64;
+            crate::near_mock::hosts::charge_gas(
+                &mut caller,
+                crate::near_mock::READ_MEMORY_BASE_GAS
+                    + crate::near_mock::READ_MEMORY_BYTE_GAS * acct_len,
+            )?;
             let acct = mem_read_str(&mut caller, args[0].unwrap_i64(), args[1].unwrap_i64())
                 .unwrap_or_default();
-            eprintln!("  → promise_batch_create({}) [dag]", acct);
+            mtrace!("  → promise_batch_create({}) [dag]", acct);
             results[0] = Val::I64(dag_push(vec![], acct, vec![]) as i64);
             Ok(())
         },
@@ -910,9 +1167,12 @@ fn build_promise_hosts(
                 }
                 u128::from_le_bytes(buf)
             };
-            eprintln!(
+            mtrace!(
                 "  → action_fn_call(idx={}, {} args={} dep={})",
-                idx, method, args_json, dep
+                idx,
+                method,
+                args_json,
+                dep
             );
             PROMISE_DAG.with(|d| {
                 if let Some(b) = d.borrow_mut().get_mut(idx) {
@@ -968,9 +1228,11 @@ fn build_promise_hosts(
                 .unwrap_or_default();
             let reg = args[6].unwrap_i64() as u64;
             let contract = exec_ctx_or_default().contract;
-            eprintln!(
+            mtrace!(
                 "  → promise_yield_create({} args={}) on {}",
-                method, args_json, contract
+                method,
+                args_json,
+                contract
             );
             let batch_creator = exec_ctx_or_default().contract;
             let args_bytes = args_json.clone().into_bytes();
@@ -1056,26 +1318,26 @@ fn build_promise_hosts(
                                     is_yield: true,
                                 }
                             } else {
-                                eprintln!("  ⚠ yield_resume: bad persisted spec at {}", idx);
+                                mtrace!("  ⚠ yield_resume: bad persisted spec at {}", idx);
                                 results[0] = Val::I64(0);
                                 return Ok(());
                             }
                         }
                         None => {
-                            eprintln!("  ⚠ yield_resume: idx {} is not a yield promise", idx);
+                            mtrace!("  ⚠ yield_resume: idx {} is not a yield promise", idx);
                             results[0] = Val::I64(0);
                             return Ok(());
                         }
                     }
                 }
             };
-            eprintln!("  ⏵ yield_resume({}) payload={}", idx, payload);
+            mtrace!("  ⏵ yield_resume({}) payload={}", idx, payload);
             let (method, args_json, _) = match batch.actions.first() {
                 Some(PAction::FnCall {
                     method, args, gas, ..
                 }) => (method.clone(), args.clone(), gas),
                 _ => {
-                    eprintln!("  ⚠ yield_resume: no callback action on idx {}", idx);
+                    mtrace!("  ⚠ yield_resume: no callback action on idx {}", idx);
                     results[0] = Val::I64(0);
                     return Ok(());
                 }
@@ -1103,8 +1365,8 @@ fn build_promise_hosts(
                         println!("📄 (yield) {}", s);
                     }
                 }
-                Ok(None) => eprintln!("  ⚠ yield callback trapped"),
-                Err(e) => eprintln!("  ⚠ yield callback error: {}", e),
+                Ok(None) => mtrace!("  ⚠ yield callback trapped"),
+                Err(e) => mtrace!("  ⚠ yield callback error: {}", e),
             }
             results[0] = Val::I64(1);
             Ok(())
@@ -1168,9 +1430,14 @@ fn build_promise_hosts(
         "promise_and",
         &mut *store,
         FuncType::new(engine, vec![ValType::I64; 2], vec![ValType::I64]),
-        move |caller, args, results| {
-            let ptr = args[0].unwrap_i64() as usize;
+        move |mut caller, args, results| {
             let count = args[1].unwrap_i64() as usize;
+            crate::near_mock::hosts::charge_gas(
+                &mut caller,
+                crate::near_mock::PROMISE_AND_BASE_GAS
+                    + crate::near_mock::PROMISE_AND_PER_GAS * count as u64,
+            )?;
+            let ptr = args[0].unwrap_i64() as usize;
             let mut deps = Vec::new();
             if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
                 let md = mem.data(&caller);
@@ -1235,9 +1502,13 @@ fn build_promise_hosts(
         "promise_return",
         &mut *store,
         FuncType::new(engine, vec![ValType::I64], vec![]),
-        |_, args, _| {
+        |mut caller, args, _| {
+            crate::near_mock::hosts::charge_gas(
+                &mut caller,
+                crate::near_mock::PROMISE_RETURN_GAS,
+            )?;
             PENDING_RETURN.with(|p| *p.borrow_mut() = Some(args[0].unwrap_i64() as usize));
-            eprintln!("  → promise_return({})", args[0].unwrap_i64());
+            mtrace!("  → promise_return({})", args[0].unwrap_i64());
             Ok(())
         },
     );
@@ -1269,10 +1540,7 @@ pub(crate) fn init_sandbox(
             )
         })?;
         eprintln!("📦 {} → {}", acct, path);
-        modules.insert(
-            acct.to_string(),
-            wasmtime::Module::from_binary(&engine, &bytes)?,
-        );
+        modules.insert(acct.to_string(), compile_module(&engine, &bytes)?);
     }
 
     let loaded_storage: HashMap<Vec<u8>, Vec<u8>> = std::fs::read(state_path)
@@ -1388,7 +1656,7 @@ pub(crate) fn credit_attach(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u128);
     st.storage.insert(key, (bal + amt).to_string().into_bytes());
-    eprintln!(
+    mtrace!(
         "  💰 attached {} yocto → {} (bal {})",
         amt,
         contract_acct,
@@ -1445,13 +1713,10 @@ pub(crate) fn run_scenario(path: &str) -> Result<(), Box<dyn std::error::Error>>
         .map(|(a, _)| a.to_string())
         .unwrap_or_else(|| "owner.test.near".into());
 
-    let mut fuel_cfg = Config::new();
-    fuel_cfg.consume_fuel(true);
+    let mut fuel_cfg = base_engine_config();
     // epoch_interruption MUST be on or set_epoch_deadline is inert —
     // no epoch checks get compiled into wasm, so spin loops run forever.
     fuel_cfg.epoch_interruption(true);
-    fuel_cfg.max_wasm_stack(64 * 1024 * 1024);
-    fuel_cfg.async_stack_size(64 * 1024 * 1024);
     let engine = Rc::new(wasmtime::Engine::new(&fuel_cfg)?);
     // Epoch ticker: 1 tick ≈ 1 ms ⇒ a `gas: T` step's deadline ≈ T ms of
     // wall clock (1 TGas ≈ 1 ms of NEAR compute). Wasmtime fuel alone can't
@@ -1687,14 +1952,19 @@ pub(crate) fn run_scenario(path: &str) -> Result<(), Box<dyn std::error::Error>>
         let prepaid: u64 = gas_cap_tgas
             .map(|t| t.saturating_mul(1_000_000_000_000))
             .unwrap_or_else(|| PREPAID_FUEL.with(|f| *f.borrow()));
-        let mut store = wasmtime::Store::new(&*engine, ());
-        store.set_fuel(prepaid)?;
+        let mut store = new_store(&*engine);
         // Epoch deadline: ~t ms for gas-capped steps, 20 s wall bound
         // otherwise (ticker ticks every 1 ms; epochs only advance when a
         // gas-capped scenario spawned the ticker — otherwise inert).
         store.set_epoch_deadline(gas_cap_tgas.unwrap_or(20_000).max(1));
         let linker = build_env_linker(&mut store, &*engine, state.clone(), args_json.into_bytes())?;
         let instance = linker.instantiate(&mut store, &module)?;
+        if let Some(g) = instance.get_global(&mut store, crate::near_mock::REMAINING_GAS_EXPORT) {
+            g.set(&mut store, wasmtime::Val::I64(prepaid as i64)).ok();
+        }
+        if let Some(start) = instance.get_func(&mut store, "start") {
+            let _ = start.call(&mut store, &[], &mut []);
+        }
         let result = instance
             .get_func(&mut store, &method)
             .ok_or(format!(
@@ -1714,7 +1984,7 @@ pub(crate) fn run_scenario(path: &str) -> Result<(), Box<dyn std::error::Error>>
                     if fail_receipts_any() {
                         print_dag_map();
                     }
-                    eprintln!("  ⛓ resolving promise DAG (root {})", idx);
+                    mtrace!("  ⛓ resolving promise DAG (root {})", idx);
                     match execute_promise(idx) {
                         Err(e) => {
                             println!("❌ receipt chain failed: {}", e);
@@ -2526,6 +2796,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(d) = flag_val("--deposit") {
         std::env::set_var("NEAR_MOCK_ATTACH", d.trim());
     }
+    // --signer <account> — same env-mirror pattern as --deposit. The bare
+    // wasm runner used to silently DROP --signer (only the cross/call paths
+    // parsed it), so predecessor_account_id() stayed owner.test.near and
+    // deposits minted under the wrong token id (nep141:<predecessor>).
+    // Found running the deployed intents.near wasm (2026-09-10).
+    if let Some(s) = flag_val("--signer") {
+        std::env::set_var("NEAR_MOCK_SIGNER", s.trim());
+    }
     // --state <path> mirrors the NEAR_MOCK_STATE env var (same single source
     // of truth); flag wins over a pre-set env value.
     if let Some(p) = flag_val("--state") {
@@ -2655,15 +2933,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wasm_bytes = std::fs::read(wasm_path)?;
     println!("📦 {} ({} bytes)", wasm_path, wasm_bytes.len());
 
-    let mut fuel_cfg = Config::new();
-    fuel_cfg.consume_fuel(true);
-    // 2026-08-29: default wasm stack (~8MB) exhausts around 900 nested interpreted calls in
-    // meta-circular interpreters; NEAR host allows much deeper. 64MB keeps near-mock from
-    // being the bottleneck while validating real programs.
-    fuel_cfg.max_wasm_stack(64 * 1024 * 1024);
-    fuel_cfg.async_stack_size(64 * 1024 * 1024);
-    let engine = Engine::new(&fuel_cfg)?;
-    let module = Module::from_binary(&engine, &wasm_bytes)?;
+    // (stack headroom rationale: 2026-08-29 — default ~8MB exhausts around 900
+    // nested interpreted calls; 64MB keeps near-mock from being the bottleneck)
+    let engine = Engine::new(&base_engine_config())?;
+    let module = compile_module(&engine, &wasm_bytes)?;
 
     if method == "exports" {
         for exp in module.exports() {
@@ -2698,8 +2971,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         view: run_view,
     }));
 
-    let mut store = Store::new(&engine, ());
-    store.set_fuel(prepaid_g)?;
+    let mut store = new_store(&engine);
     PREPAID_FUEL.with(|f| *f.borrow_mut() = prepaid_g);
     // 1024 pages = 64MB initial memory. Enough that wee_alloc never needs memory_grow.
 
@@ -2738,6 +3010,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let linker = build_env_linker(&mut store, &engine, state.clone(), args_bytes.clone())?;
     let instance = linker.instantiate(&mut store, &module)?;
+
+    // Gas budget into the instrumented global (fuel disabled); run the
+    // exported start function if the instrumented module has one.
+    if let Some(g) = instance.get_global(&mut store, crate::near_mock::REMAINING_GAS_EXPORT) {
+        g.set(&mut store, wasmtime::Val::I64(prepaid_g as i64)).ok();
+    }
+    if let Some(start) = instance.get_func(&mut store, "start") {
+        let _ = start.call(&mut store, &[], &mut []);
+    }
 
     // Check ACTUAL memory (WASM-defined, not our unused one)
     let real_mem = instance.get_memory(&mut store, "memory").unwrap();
@@ -2801,8 +3082,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Reset fuel for the measured run (warm-up, if any, burned fuel too)
-    store.set_fuel(prepaid_g)?;
+    // Reset the gas budget for the measured run (warm-up burned gas too)
+    if let Some(g) = instance.get_global(&mut store, crate::near_mock::REMAINING_GAS_EXPORT) {
+        g.set(&mut store, wasmtime::Val::I64(prepaid_g as i64)).ok();
+    }
     // Reset trie-touch cache too: the measured run starts with a cold trie,
     // just like a real transaction would.
     state.lock().unwrap().touched.clear();
@@ -2875,7 +3158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drop(st); // release the print-section guard; execute_promise relocks
             let pending = PENDING_RETURN.with(|p| *p.borrow());
             if let Some(idx) = pending {
-                eprintln!("  ⛓ resolving promise DAG (root {})", idx);
+                mtrace!("  ⛓ resolving promise DAG (root {})", idx);
                 match execute_promise(idx) {
                     Err(e) => {
                         println!("❌ receipt chain failed: {}", e);
@@ -2933,16 +3216,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Gas report (1 fuel = 1 gas unit; host-call table is indicative-legacy)
-    let mut gas_burnt = prepaid_g;
-    if let Ok(remaining) = store.get_fuel() {
-        gas_burnt = prepaid_g.saturating_sub(remaining);
-        println!(
-            "⛽ gas: {:.6} Tgas burnt / {:.6} Tgas prepaid",
-            gas_burnt as f64 / 1e12,
-            prepaid_tgas
-        );
-    }
+    // Gas report (instrumented remaining_gas global; PV155 per-op costs)
+    let gas_burnt = {
+        let remaining = instance
+            .get_global(&mut store, crate::near_mock::REMAINING_GAS_EXPORT)
+            .map(|g| match g.get(&mut store) {
+                wasmtime::Val::I64(v) => u64::try_from(v).unwrap_or(0),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        prepaid_g.saturating_sub(remaining)
+    };
+    println!(
+        "⛽ gas: {:.6} Tgas burnt / {:.6} Tgas prepaid",
+        gas_burnt as f64 / 1e12,
+        prepaid_tgas
+    );
 
     // Storage diff vs the pre-call snapshot (human summary + --json payload)
     let (added, changed, removed) = {

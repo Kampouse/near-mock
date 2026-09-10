@@ -16,7 +16,7 @@ cargo install near-mock   # or: git clone + cargo build --release
 | Startup | seconds | instant |
 | Deterministic replay | no | yes (pin seed/time/epoch) |
 | Real crypto precompiles | yes | yes (same crates) |
-| Gas metering | protocol-accurate | PV155 fee schedule |
+| Gas metering | protocol-accurate | protocol-accurate (finite-wasm instrumentation, PV155) |
 | CI-friendly | flaky, slow | trivially hermetic |
 
 Contracts only ever see host calls, state, and gas. near-mock provides all
@@ -132,3 +132,29 @@ seeded, not beacon-derived.
 
 Battle-tested against Burrow margin flows (cross-contract, callbacks, batch
 actions) with live-mainnet snapshots. 68-check hermetic verify suite.
+
+## 0.2.0 — mainnet-parity gas engine
+
+Gas is no longer an approximation. Every contract is instrumented with the same
+finite-wasm pass mainnet uses (`prepare_v3` port), metering PV155 costs into an
+exported `remaining_gas` global — wasmtime fuel is gone.
+
+- **Instruction gas**: identical instrumentation + cost model (regular_op_cost,
+  control flow free, bulk ops = base + unit × runtime length)
+- **Host costs**: full PV155 composites — per-call base, read/write_memory,
+  register costs, utf8 decoding on logs, storage + trie, crypto precompiles
+- **Action fees**: receipt creation + function-call base/byte, entry and every
+  promise sub-receipt
+- **Stack limit**: 262,144-frame instrumented budget (mainnet's model)
+- **Limits**: memory capped at 2048 pages, registers 100 MiB/1 GiB (mainnet values)
+- **NaN canonicalization** on (mainnet setting); OOG traps with mainnet's message
+
+Also: `MockChain` outcomes now expose per-tx logs, normalized panic classes,
+and promise-receipt failures; `args_bytes()` for binary-arg contracts; a
+`stream_replay` example (live mainnet differential replayer) and `vm_limits`
+parity tests. Fixed: promise-outcome memo leaked across transactions (infinite
+drain loop in long-running processes).
+
+Known calibration gap: trie-node charges use a flat walk model (mainnet's scale
+with real trie/proof size) — measured ~0.6x on 10+ GB contracts, ~0.9x+ on
+small ones.
