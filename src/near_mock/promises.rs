@@ -25,6 +25,11 @@ pub(crate) fn receipt_traps_reset() {
     RECEIPT_TRAPS.with(|t| t.borrow_mut().clear());
 }
 
+/// Last captured trap reason (for final-callback status reporting).
+pub(crate) fn receipt_traps_peek_last() -> Option<String> {
+    RECEIPT_TRAPS.with(|t| t.borrow().last().cloned())
+}
+
 /// Take the captured receipt traps (called once per tx, after the DAG ran).
 pub(crate) fn receipt_traps_drain() -> Vec<String> {
     RECEIPT_TRAPS.with(|t| std::mem::take(&mut *t.borrow_mut()))
@@ -231,15 +236,22 @@ pub(crate) fn sub_execute(
             crate::near_mock::fork_get_module(&engine, account)
         });
     let Some(module) = module else {
-        // 2026-09-02 live-caught (nostr-gov tk="nil"): unknown-account FnCall
-        // receipts FAIL on-chain (AccountDoesNotExist). The old silent
-        // Ok(None) let gauntlets pass while every payout routed to a
-        // phantom contract. Hard-error so the step shows the failure.
-        return Err(format!(
-            "MOCK-CHAIN-FAILURE: promise FnCall to unknown account '{}' (on-chain: AccountDoesNotExist)",
+        // Unknown-account FnCall receipts FAIL on-chain (AccountDoesNotExist)
+        // — but ONLY the receipt fails: the parent tx COMMITS and any
+        // callback receives a Failed promise_result (2026-09-10 receipt-
+        // semantics fix; the 2026-09-02 hard-error overcorrected silent
+        // Ok(None) into whole-tx rollback, which made on-chain recovery
+        // paths — e.g. "MPC down → refund bets" — untestable).
+        // Record the reason for outcome.receipt_failures, then Failed.
+        ptrace!(
+            "  ⚠ cross: FnCall to unknown account '{}' → receipt FAILED (parent commits)",
             account
-        )
-        .into());
+        );
+        RECEIPT_TRAPS.with(|t| {
+            t.borrow_mut()
+                .push(format!("AccountDoesNotExist: {account}"))
+        });
+        return Ok(None);
     };
     let state = STATE_ARC
         .with(|s| s.borrow().clone())

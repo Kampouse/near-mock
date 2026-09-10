@@ -200,3 +200,16 @@ Fetches the real transaction, forks mainnet state at the block before it
 executed, replays the entry receipt with the real predecessor/args/deposit,
 and diffs status/logs/gas against mainnet's recorded outcome. 
 adds the full host-call timeline — internals mainnet can never show.
+
+## 0.4.0 — chain-faithful receipt semantics
+
+Receipts are independent atomic units (like the chain):
+- a cross-contract receipt to an UNKNOWN account fails ONLY the receipt —
+  the parent commits, callbacks receive a Failed promise_result
+  (recovery paths — "MPC down, refund bets" — are testable now)
+- the tx status follows the FINAL receipt of the returned chain; earlier
+  receipts' state stays committed (no whole-tx rollback)
+- promise_result ABI fix: Failed = 0 (was 2, which near-sdk parses as
+  NotReady — recovery handlers never fired)
+- bare wasm traps classify into nearcore's WasmTrap taxonomy (message-less
+  release builds still compare by failure class)

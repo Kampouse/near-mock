@@ -661,6 +661,20 @@ pub(crate) fn execute_tx(
                     }
                     Ok(results) => {
                         outcome.receipt_results = results.clone();
+                        // NEAR tx semantics: the transaction's status follows
+                        // the FINAL receipt of the returned chain. A trapped
+                        // final callback ⇒ tx FAILED — but earlier receipts'
+                        // state stays COMMITTED (no rollback: receipts are
+                        // independent atomic units; 2026-09-10 fix — the old
+                        // code reported ok=true for a failed final callback).
+                        if results.last().is_some_and(|r| r.is_none()) {
+                            outcome.ok = false;
+                            let why = crate::near_mock::promises::receipt_traps_peek_last()
+                                .unwrap_or_else(|| "final receipt failed".into());
+                            outcome.error =
+                                Some(format!("receipt chain failed: final receipt: {why}"));
+                            outcome.panic = Some(why);
+                        }
                         if let Some(bytes) = results.iter().rev().find_map(|r| r.as_ref().cloned())
                         {
                             if !bytes.is_empty() {
@@ -732,6 +746,22 @@ fn extract_panic(raw: &str) -> Option<String> {
     }
     if raw.contains("WasmTrap: StackOverflow") {
         return Some("WasmTrap: StackOverflow".to_string());
+    }
+    // Bare traps (release builds with stripped messages, panic_immediate_abort,
+    // custom wasm): classify by wasmtime trap text into nearcore's WasmTrap
+    // taxonomy so failure CLASSES are comparable even without messages.
+    for (needle, class) in [
+        ("out of bounds memory access", "WasmTrap: MemoryOutOfBounds"),
+        ("integer divide by zero", "WasmTrap: IntegerDivisionByZero"),
+        ("integer overflow", "WasmTrap: IntegerOverflow"),
+        ("indirect call to null", "WasmTrap: IndirectCallToNull"),
+        ("signature mismatch", "WasmTrap: IncorrectCallIndirectSignature"),
+        ("unreachable", "WasmTrap: Unreachable"),
+        ("call stack exhausted", "WasmTrap: StackOverflow"),
+    ] {
+        if raw.contains(needle) {
+            return Some(class.to_string());
+        }
     }
     let i = raw.find("PANIC: ")?;
     let rest = &raw[i + "PANIC: ".len()..];
@@ -1494,7 +1524,12 @@ fn build_promise_hosts(
                     }
                     results[0] = Val::I64(1);
                 }
-                Some(None) => results[0] = Val::I64(2),
+                // NEAR ABI (nearcore VmResultPromiseResult): 0 = Failed,
+                // 1 = Successful, 2 = NotReady. A failed receipt (Some(None))
+                // is FAILED = 0 — the mock returned 2 here, which near-sdk
+                // parses as NotReady and recovery handlers never fired
+                // (caught by the receipt-semantics regression 2026-09-10).
+                Some(None) => results[0] = Val::I64(0),
             }
             Ok(())
         },
