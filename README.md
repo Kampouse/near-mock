@@ -191,3 +191,12 @@ resolved once and pinned).
 `after_key_base64`) has no such check — fork-mode pages through it.
 Validated byte-identical on the biggest contracts on mainnet (wrap.near
 158MB, token.sweat, intents.near 11.7GB).
+
+## replay — "why did my tx fail?" as a one-liner
+
+
+
+Fetches the real transaction, forks mainnet state at the block before it
+executed, replays the entry receipt with the real predecessor/args/deposit,
+and diffs status/logs/gas against mainnet's recorded outcome. 
+adds the full host-call timeline — internals mainnet can never show.

@@ -2196,6 +2196,40 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+/// Plain POST JSON (FastNear tx API etc. — not a JSON-RPC envelope).
+fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body.to_string(),
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("curl exit {}", out.status));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON: {e}"))
+}
+
+/// Snapshot of this tx's host-call trace (for --json consumers).
+pub(crate) fn host_trace_entries() -> Vec<(String, u64, bool)> {
+    match HOST_TRACE.lock() {
+        Ok(g) => g
+            .as_ref()
+            .map(|v| v.iter().map(|e| (e.name.clone(), e.gas, e.err)).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Install fork config into RUN_CFG (library builder + CLI both use this).
 pub(crate) fn set_fork_cfg(rpc: String, block: Option<u64>) {
     RUN_CFG.with(|c| {
@@ -2247,11 +2281,70 @@ pub(crate) fn fork_latest_block(rpc: &str) -> Result<u64, Box<dyn std::error::Er
     Err(format!("fork_latest_block failed: {last}").into())
 }
 
+/// Fork endpoint fallbacks (public RPCs rate-limit/deprecate; try in order).
+pub(crate) const FORK_RPC_FALLBACKS: &[&str] = &[
+    "https://archival-rpc.mainnet.near.org",
+    "https://rpc.mainnet.fastnear.com",
+    "https://rpc.mainnet.near.org",
+];
+
+/// Try a fork query against the primary RPC, then the fallback chain.
+pub(crate) fn fork_rpc_query(
+    primary: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let mut last = match rpc_query(primary, params.clone()) {
+        Ok(r) => return Ok(r),
+        Err(e) => e,
+    };
+    for url in FORK_RPC_FALLBACKS {
+        if *url == primary {
+            continue;
+        }
+        match rpc_query(url, params.clone()) {
+            Ok(r) => return Ok(r),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// The block reference for fork queries: pinned height or "final".
 pub(crate) fn fork_block_ref(cfg: &crate::near_mock::gas::ForkCfg) -> serde_json::Value {
     match cfg.block {
         Some(b) => serde_json::json!({ "block_id": b }),
         None => serde_json::json!({ "finality": "final" }),
+    }
+}
+
+const FORK_ABSENT_KEY: &[u8] = b"\x00\x00__near_mock_fork_absent__";
+
+/// Persist tombstones into storage so `MockChain::save()` carries them.
+pub(crate) fn fork_sync_absents_to_storage(state: &Arc<Mutex<MockState>>) {
+    let absents: Vec<Vec<u8>> = FORK_ABSENT.with(|a| a.borrow().iter().cloned().collect());
+    if absents.is_empty() {
+        return;
+    }
+    if let Ok(enc) = bincode::serialize(&absents) {
+        state
+            .lock()
+            .unwrap()
+            .storage
+            .insert(FORK_ABSENT_KEY.to_vec(), enc);
+    }
+}
+
+/// Seed tombstones from storage (after a state-file load). Called on fork init.
+pub(crate) fn fork_restore_absents_from_storage(state: &Arc<Mutex<MockState>>) {
+    let enc = state.lock().unwrap().storage.remove(FORK_ABSENT_KEY);
+    if let Some(enc) = enc {
+        if let Ok(absents) = bincode::deserialize::<Vec<Vec<u8>>>(&enc) {
+            FORK_ABSENT.with(|a| {
+                for k in absents {
+                    a.borrow_mut().insert(k);
+                }
+            });
+        }
     }
 }
 
@@ -2281,7 +2374,15 @@ pub(crate) fn fork_get_module(
     {
         params[k] = v.clone();
     }
-    let res = rpc_query(&cfg.rpc, params).ok()?;
+    let res = match fork_rpc_query(&cfg.rpc, params) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "  🍴 fork: view_code for {account} failed: {e} — old block? use an archival --url"
+            );
+            return None;
+        }
+    };
     let code_b64 = res.get("code_base64")?.as_str()?;
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -2348,7 +2449,7 @@ pub(crate) fn fork_page_in(
             params["after_key_base64"] =
                 serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(after));
         }
-        let res = match rpc_query(&cfg.rpc, params) {
+        let res = match fork_rpc_query(&cfg.rpc, params) {
             Ok(r) => r,
             Err(e) => {
                 mtrace!("  🍴 fork: view_state failed: {}", e);
@@ -2928,19 +3029,29 @@ fn run_fork(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let deposit: u128 = val("--deposit").and_then(|d| d.parse().ok()).unwrap_or(0);
     let is_view = flag("--view").is_some();
 
+    let json_mode = flag("--json").is_some();
+    if json_mode {
+        std::env::set_var("NEAR_MOCK_QUIET", "1");
+    }
     match val("--block").as_deref() {
         Some("final") => {
-            println!("🍴 fork: {account} @ final (unpinned — state may drift mid-session)");
+            if !json_mode {
+                println!("🍴 fork: {account} @ final (unpinned — state may drift mid-session)");
+            }
             set_fork_cfg(rpc.clone(), None);
         }
         Some(s) => {
             let b: u64 = s.parse().map_err(|_| usage)?;
-            println!("🍴 fork: {account} @ block {b}");
+            if !json_mode {
+                println!("🍴 fork: {account} @ block {b}");
+            }
             set_fork_cfg(rpc.clone(), Some(b));
         }
         None => {
             let b = fork_latest_block(&rpc)?;
-            println!("🍴 fork: {account} @ latest block {b} (pinned)");
+            if !json_mode {
+                println!("🍴 fork: {account} @ latest block {b} (pinned)");
+            }
             set_fork_cfg(rpc.clone(), Some(b));
         }
     }
@@ -2953,29 +3064,53 @@ fn run_fork(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // fork cfg was set explicitly above (pinned / final / latest-pinned);
     // the builder just installs the sandbox — .fork() would re-resolve.
     let chain = MockChain::builder().signer(&signer).build()?;
-    println!(
-        "▶ {account}.{method}({args_json}){}",
-        if is_view { " [view]" } else { "" }
-    );
+    if !json_mode {
+        println!(
+            "▶ {account}.{method}({args_json}){}",
+            if is_view { " [view]" } else { "" }
+        );
+    }
 
     let mut call = if is_view {
         chain.view(account_static, method_static)
     } else {
         chain.call(account_static, method_static)
     };
-    call = call.args(args_json).from(signer.clone());
+    call = call.args(args_json.clone()).from(signer.clone());
     if deposit > 0 {
         call = call.attach(deposit);
     }
     let out = call.fire()?;
 
-    if out.ok {
+    if flag("--json").is_some() {
+        let ret = out
+            .return_data
+            .as_ref()
+            .map(|d| match std::str::from_utf8(d) {
+                Ok(s) => serde_json::Value::String(s.to_string()),
+                Err(_) => serde_json::Value::String(format!("<{} binary bytes>", d.len())),
+            })
+            .unwrap_or(serde_json::Value::Null);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "account": account, "method": method, "args": args_json,
+                "signer": signer, "view": is_view,
+                "ok": out.ok, "return": ret,
+                "error": out.error, "panic": out.panic,
+                "gas_burnt": out.gas_burned, "logs": out.logs,
+            }))?
+        );
+    } else if out.ok {
         println!("✅ Success");
         if let Some(data) = &out.return_data {
             match std::str::from_utf8(data) {
                 Ok(s) => println!("📄 {s}"),
                 Err(_) => println!("📄 <{} binary bytes>", data.len()),
             }
+        }
+        for l in &out.logs {
+            println!("  LOG: {l}");
         }
     } else {
         println!("❌ {}", out.error.as_deref().unwrap_or("failed"));
@@ -2984,8 +3119,256 @@ fn run_fork(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         std::process::exit(1);
     }
-    for l in &out.logs {
-        println!("  LOG: {l}");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// near-mock replay — re-execute a REAL mainnet transaction locally,
+// against forked state at its block, with full internals.
+//
+//   near-mock replay <tx-hash> [--url RPC] [--json] [--trace] [--block H]
+//
+// The "why did my tx fail?" command: fetches the tx from FastNear, finds
+// the first external function-call receipt, forks state at the block
+// BEFORE it executed, replays it with the real predecessor/args/deposit,
+// and diffs the outcome against mainnet's recorded result.
+// ═══════════════════════════════════════════════════════════════════
+fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine;
+    let usage = "usage: near-mock replay <tx-hash> [--url RPC] [--json] [--trace] [--block H] [--state FILE]";
+    let flag = |name: &str| args.iter().position(|a| a == name);
+    let val = |name: &str| -> Option<String> { flag(name).and_then(|i| args.get(i + 1)).cloned() };
+    let json_out = flag("--json").is_some();
+    if json_out {
+        std::env::set_var("NEAR_MOCK_QUIET", "1");
+    }
+    if flag("--trace").is_some() {
+        std::env::set_var("NEAR_MOCK_TRACE", "1");
+    }
+    let hash = args.get(2).ok_or(usage)?;
+    // replay targets OLD blocks by nature — archival default (non-archival
+    // answers GARBAGE_COLLECTED_BLOCK for anything older than ~5 epochs)
+    let rpc = val("--url").unwrap_or_else(|| "https://archival-rpc.mainnet.near.org".into());
+    let raw = http_post_json(
+        "https://tx.main.fastnear.com/v0/transactions",
+        &serde_json::json!({ "tx_hashes": [hash] }),
+    )
+    .map_err(|e| format!("tx fetch failed: {e} (is the hash right?)"))?;
+    let tx = raw
+        .get("transactions")
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .ok_or("transaction not found on FastNear (pruned or wrong hash)")?;
+
+    // 2. first EXTERNAL function-call receipt (predecessor not the receiver;
+    //    self-callbacks are promise machinery we execute internally)
+    let mut chosen: Option<(String, String, Vec<u8>, u128, String, u64, u64)> = None;
+    let mut receipts: Vec<&serde_json::Value> = tx
+        .get("receipts")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    receipts.sort_by_key(|r| {
+        (
+            r.pointer("/receipt/block_height")
+                .and_then(|b| b.as_u64())
+                .unwrap_or(0),
+            r.pointer("/receipt/receipt_index")
+                .and_then(|b| b.as_u64())
+                .unwrap_or(0),
+        )
+    });
+    for r in &receipts {
+        let inner = r.pointer("/receipt").unwrap_or(&serde_json::Value::Null);
+        let receiver = inner
+            .get("receiver_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let predecessor = inner
+            .get("predecessor_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if receiver.is_empty() || predecessor == receiver {
+            continue;
+        }
+        let Some(action) = inner.pointer("/receipt/Action") else {
+            continue;
+        };
+        if action
+            .get("input_data_ids")
+            .and_then(|d| d.as_array())
+            .map(|d| !d.is_empty())
+            .unwrap_or(false)
+        {
+            continue; // promise-result callback — needs internal context
+        }
+        let Some(fc) = action
+            .get("actions")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.iter().find(|x| x.get("FunctionCall").is_some()))
+            .and_then(|x| x.get("FunctionCall"))
+        else {
+            continue;
+        };
+        let method = fc
+            .get("method_name")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        let args_b64 = fc
+            .get("args")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
+        let args = base64::engine::general_purpose::STANDARD
+            .decode(&args_b64)
+            .unwrap_or_default();
+        let deposit: u128 = fc
+            .get("deposit")
+            .and_then(|d| d.as_str())
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0);
+        let block = inner
+            .get("block_height")
+            .and_then(|b| b.as_u64())
+            .unwrap_or(0);
+        let ridx = inner
+            .get("receipt_index")
+            .and_then(|b| b.as_u64())
+            .unwrap_or(0);
+        chosen = Some((
+            receiver.to_string(),
+            method,
+            args,
+            deposit,
+            predecessor.to_string(),
+            block,
+            ridx,
+        ));
+        break;
+    }
+    let Some((receiver, method, args, deposit, predecessor, exec_block, ridx)) = chosen else {
+        return Err("no replayable external function-call receipt in this tx \
+(pure transfer / callback-only / data receipts)"
+            .into());
+    };
+
+    // 3. fork at the block BEFORE execution (pre-tx state)
+    let pin = val("--block")
+        .and_then(|b| b.parse::<u64>().ok())
+        .unwrap_or(exec_block.saturating_sub(1));
+    set_fork_cfg(rpc.clone(), Some(pin));
+
+    // 4. mainnet ground truth for this receipt
+    let eo = receipts
+        .iter()
+        .find(|r| {
+            r.pointer("/receipt/receipt_index").and_then(|b| b.as_u64()) == Some(ridx)
+                && r.pointer("/receipt/block_height").and_then(|b| b.as_u64()) == Some(exec_block)
+        })
+        .and_then(|r| r.pointer("/execution_outcome/outcome"));
+    let mn_success = eo
+        .and_then(|o| o.get("status"))
+        .map(|st| !st.get("Failure").is_some())
+        .unwrap_or(false);
+    let mn_failure = eo
+        .and_then(|o| {
+            o.pointer("/status/Failure/ActionError/kind/FunctionCallError/ExecutionError")
+        })
+        .and_then(|e| e.as_str())
+        .map(String::from);
+    let mn_gas = eo
+        .and_then(|o| o.get("gas_burnt"))
+        .and_then(|g| g.as_u64())
+        .unwrap_or(0);
+    let mn_logs: Vec<String> = eo
+        .and_then(|o| o.get("logs"))
+        .and_then(|l| l.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 5. replay locally
+    let receiver_static: &str = Box::leak(receiver.clone().into_boxed_str());
+    let method_static: &str = Box::leak(method.clone().into_boxed_str());
+    let state_file = val("--state");
+    let mut builder = MockChain::builder();
+    if let Some(f) = &state_file {
+        builder = builder.state_path(f);
+    }
+    let chain = builder.signer(&predecessor).build()?;
+    crate::near_mock::fork_restore_absents_from_storage(&state_arc_tls().unwrap());
+    let out = chain
+        .call(receiver_static, method_static)
+        .args_bytes(args)
+        .from(predecessor.clone())
+        .attach(deposit)
+        .fire()?;
+    if let Some(f) = &state_file {
+        crate::near_mock::fork_sync_absents_to_storage(&state_arc_tls().unwrap());
+        chain.save().ok();
+    }
+
+    let logs_match = out.logs == mn_logs;
+    let gas_ratio = if mn_gas > 0 {
+        Some(out.gas_burned as f64 / mn_gas as f64)
+    } else {
+        None
+    };
+
+    if json_out {
+        let j = serde_json::json!({
+            "tx": hash, "block": pin, "receipt": {
+                "receiver": receiver, "method": method, "predecessor": predecessor,
+                "deposit": deposit.to_string(), "exec_block": exec_block, "receipt_index": ridx,
+            },
+            "mainnet": { "success": mn_success, "failure": mn_failure,
+                         "gas_burnt": mn_gas, "logs": mn_logs },
+            "mock": { "ok": out.ok, "error": out.error, "panic": out.panic,
+                      "gas_burnt": out.gas_burned, "logs": out.logs,
+                      "receipt_failures": out.receipt_failures },
+            "match": { "status": out.ok == mn_success, "logs_exact": logs_match,
+                       "gas_ratio": gas_ratio },
+            "host_trace": if flag("--trace").is_some() {
+                serde_json::Value::Array(host_trace_entries().into_iter()
+                    .map(|(n, g, e)| serde_json::json!({"host": n, "gas": g, "err": e}))
+                    .collect())
+            } else { serde_json::Value::Null },
+        });
+        println!("{}", serde_json::to_string_pretty(&j)?);
+    } else {
+        println!("🔁 replay {hash} (fork @ block {pin}, receipt executed @ {exec_block})");
+        println!("   {predecessor} → {receiver}.{method} (deposit {deposit})");
+        println!(
+            "   mainnet : {} gas={mn_gas} {}",
+            if mn_success { "SUCCESS" } else { "FAIL" },
+            mn_failure
+                .as_deref()
+                .map(|f| format!("— {f}"))
+                .unwrap_or_default()
+        );
+        println!(
+            "   mock    : {} gas={} {}",
+            if out.ok { "SUCCESS" } else { "FAIL" },
+            out.gas_burned,
+            out.panic
+                .as_deref()
+                .map(|p| format!("— {p}"))
+                .unwrap_or_default()
+        );
+        println!(
+            "   logs {} · gas {}",
+            if logs_match { "MATCH ✓" } else { "differ" },
+            gas_ratio
+                .map(|r| format!("{r:.2}x"))
+                .unwrap_or_else(|| "n/a".into())
+        );
+        if out.ok != mn_success || (!mn_success && out.panic.as_deref() != mn_failure.as_deref()) {
+            println!("   ⚠ outcome diverges from mainnet — see --json for details");
+        }
     }
     Ok(())
 }
@@ -3015,6 +3398,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // self-contained binary, same pattern as near-compile 0.1.2.
     if args.get(1).map(|s| s.as_str()) == Some("fork") {
         return run_fork(&args);
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("replay") {
+        return run_replay(&args);
     }
     if args.get(1).map(|s| s.as_str()) == Some("skill") {
         const SKILL_MD: &str = include_str!("../../skills/SKILL.md");

@@ -1,113 +1,97 @@
 ---
 name: near-mock
 description: >-
-    Run and test NEAR smart contracts locally with full host semantics —
-    no node, no network, deterministic. Use when a task involves testing,
-    debugging, or forensically analyzing NEAR contracts of ANY origin
-    (Rust near-sdk, near-contract-standard, or lisp-rlm output): local
-    execution, live-state snapshots, state surgery, scenario flows, or
-    gas/host-call analysis.
+    Run, test, debug and REPLAY NEAR smart contracts locally — real wasm,
+    real host surface, mainnet-parity gas, and FORKS of real mainnet state.
+    Use for any task involving NEAR contracts: local execution, debugging
+    failed transactions, forking live state, gas analysis, scenario tests,
+    or forensic analysis of on-chain behavior.
 ---
 
-# near-mock — local NEAR contract runner (no node)
+# near-mock — local NEAR contract runner (no node, no signing, zero blast radius)
 
-Real wasm, real host surface (~140 fns incl. protocol 69/72), deterministic
-clock/entropy, receipt-atomic state — executed in-process in milliseconds.
+Real wasm, ~140 host functions, **mainnet-parity gas** (finite-wasm
+instrumentation, PV155 costs — the same meter mainnet runs), deterministic
+clock/entropy, receipt-atomic state. In-process, milliseconds.
 
 ```bash
-cargo install near-mock    # 0.1.8+
+cargo install near-mock    # 0.3.0+
 ```
 
-## The four modes
+**Safety**: near-mock never signs or broadcasts anything. Agents can point
+it at mainnet freely — writes land in local state files only.
+
+## The six modes
 
 ```bash
-# 1. single call (fresh state per default file)
-near-mock out.wasm method '{"json":"args"}' [--view]
+# 1. single call (local wasm, fresh state)
+near-mock out.wasm method '{"json":"args"}' [--view] [--json]
 
 # 2. cross: multi-contract world in one state file
 near-mock cross state.bin acct=/path/a.wasm,acct2=/path/b.wasm acct2 method '{}'
 
-# 3. scenario: scripted multi-step flows (see example-scenario.json)
+# 3. scenario: scripted multi-step flows with expectations
 near-mock scenario flow.json
 
-# 4. snapshot: pull a LIVE contract + state for local forensics
-near-mock snapshot some-contract.testnet state.bin --rpc https://rpc.testnet.near.org
-near-mock cross state.bin some-contract.testnet=some-contract.testnet.wasm \
-  some-contract.testnet some_view '{}' --view
+# 4. fork: call a REAL mainnet contract against its REAL state — zero setup
+near-mock fork intents.near is_account_locked '{"account_id":"<hex>"}'
+near-mock fork wrap.near ft_balance_of '{"account_id":"alice.near"}' --block 215138898
+#    --block H (pinned) | --block final (always-fresh, may drift) | omitted (latest, pinned)
+#    --view for read-only · --json for machine output
+#    code (view_code) + storage (paginated view_state) page in lazily —
+#    works on the biggest contracts (intents.near 11.7GB) via pagination
+
+# 5. replay: re-execute a REAL mainnet transaction locally and diff it
+near-mock replay <tx-hash> [--json] [--trace]
+#    forks state at the block before execution, replays the entry receipt
+#    with the real predecessor/args/deposit, diffs status/logs/gas vs
+#    mainnet's recorded outcome. THE "why did my tx fail?" command.
+#    --trace adds the full host-call timeline (every storage key, gas/op).
+
+# 6. snapshot: pull a contract + state for offline forensics (legacy;
+#    fork-mode usually better — snapshot fails on huge contracts)
+near-mock snapshot some-contract.testnet state.bin --rpc <archival-url>
 ```
 
-## Environment controls (determinism + identity)
+## Gas numbers are real
 
-| Var / flag | Effect |
-|---|---|
-| `NEAR_MOCK_SIGNER` | signer + predecessor for the call |
-| `NEAR_MOCK_ATTACH` / `--attach` / `--deposit` | attached deposit (yocto) — flags work in ALL modes incl. `cross` (≥0.1.7) |
-| `NEAR_MOCK_NOW` / `--now` | pin block timestamp (unix secs) |
-| `--advance <secs>` | time-travel (scenario steps accumulate it) |
-| `NEAR_MOCK_SEED` | pin random_seed |
-| `NEAR_MOCK_STATE` / `--state` | state file (default /tmp/near-mock-state.bin) |
-| `--view` | read-only: writes refused (ProhibitedInView), no persist |
-| `--dry-run` | execute + report, don't persist |
-| `--staking` | enforce 1e20 yocto/byte storage staking |
-| `--json` | machine-readable outcome (return value, gas, storage diff, events) — ALL modes incl. `cross` (≥0.1.8) |
-| `--trace` | host-call timeline + per-host gas (incl. error counts since 0.1.2) |
+Instruction gas uses the same finite-wasm instrumentation + PV155 cost
+model as mainnet (regular_op_cost/op, control flow free, bulk ops =
+base + unit × length). Host costs, action fees, register/memory
+composites are protocol-86 values. Known calibration gap: trie-node
+charges use a flat walk model — ~0.6x on 10+ GB contracts (intents,
+wrap), ~0.9x+ on small ones. `replay` prints the measured ratio.
 
-## Exit codes (CI-safe since 0.1.1)
+## Determinism controls
 
-`0` success/view/dry-run · `1` contract trap, out-of-gas, failed receipt
-chain. `near-mock x.wasm m || fail` works in scripts; `--json`'s
-`"outcome"` field agrees with `$?`.
+NEAR_MOCK_SEED (entropy) · NEAR_MOCK_NOW / --advance (clock) ·
+--fail-receipt N (injected receipt failure) · --state FILE (persistence).
+Fork-mode: pin --block for reproducibility.
 
-## Scenario runner
+## JSON everywhere
 
-Steps support `method`, `contract`, `args`, `view`, `as` (signer),
-`predecessor`, `now`, `advance` (monotonic), `gas` (TGas cap),
-`attach` (yocto), `expect` (substring or `"trap"` — traps roll back),
-`fail_receipt` (forced receipt failure), `snapshot`/`restore`/
-`expect_same_storage_as`. The runner expects `contract.wasm` beside the
-JSON unless a `manifest` maps accounts. See `example-scenario.json` in this
-skill directory — it is a complete runnable template.
+`--json` on fork/replay/cross/call: machine-readable outcome (return
+value, error class, gas, logs; replay adds the mainnet diff + host
+timeline). Prefer it when scripting or driving from an agent.
 
-## Live-contract forensics (the snapshot workflow)
+## Library
 
-1. `near-mock snapshot <acct> <state.bin> --rpc <testnet-rpc>` — wasm +
-   storage at one block (the `.wasm` lands in the cwd).
-2. `exports` / `imports` — inventory the surface; imports reveal the SDK
-   generation (protocol 69/72 hosts = current near-contract-standard).
-3. Run views via `cross`. Borsh STATE blobs: `state dump` + base64 decode
-   + read the printable strings, or call the contract's own JSON views.
-4. Mutate freely — it's a local copy. Traps roll back atomically.
-5. Chain-parity proof: fetch deployed bytes via RPC `view_code`, replay
-   under the mock — byte-identical answers prove runner fidelity (this is
-   how the value_return last-write-wins bug was caught).
-
-## State tooling
-
-```bash
-near-mock state dump <state.bin> [acct-prefix]   # stdout = pure JSON
-near-mock state import <state.bin> <dump.json>   # canonical AND legacy shapes
-near-mock reset                                   # clear default state file
+```rust
+use near_mock::chain::MockChain;
+let chain = MockChain::builder()
+    .contract("x.test.near", "out.wasm")?      // or .fork(rpc, Some(block))
+    .signer("alice.test.near")
+    .build()?;
+let out = chain.call("x.test.near", "mint").args("{}").fire()?;
+// out.ok / out.logs / out.panic / out.gas_burned / out.receipt_failures
 ```
 
-Storage is namespaced per account (`acct\x01key`); `--staking` tracks
-locked balances; storage-staking gates are enforced by contracts
-themselves via `depositGte` (ONE u128 as (lo64, hi64) — e.g. ~0.01 NEAR
-= `depositGte(0, 542)`; result is boolean-tagged).
+## Debugging recipe (agents)
 
-## Coverage facts
-
-- near-sdk 4.x/5.x, near-contract-standard (old + current import sets):
-  all instantiate. `transfer_to_gas_key`, `add_gas_key_*`,
-  `deploy/use_global_contract*`, `current_contract_code`, `chain_id` are
-  bound with documented mock approximations (loud, never silent).
-- Crypto is real: BIP-340 schnorr (stitched-lib parity verified against
-  reference vectors), ed25519, ecrecover, alt_bn128, BLS12-381, sha2/3.
-- `value_return` is last-write-wins like nearcore (≥0.1.5) — multi-return
-  contracts behave identically on mock and chain.
-
-## Install the skill into a project
-
-```bash
-near-mock skill              # writes .agents/skills/near-mock/ here
-near-mock skill --stdout     # print instead of installing
-```
+1. "What does mainnet state say?" → `near-mock fork <acct> <view> '{...}' --json`
+2. "Why did tx T fail?" → `near-mock replay T --json --trace`
+3. Divergence mock-vs-mainnet → compare panic classes + host trace; gas
+   ratio ≈ 0.6 on whale contracts is expected calibration, not a bug.
+4. Multi-step flows → `near-mock scenario` (see example-scenario.json)
+5. Live differential testing at scale → examples/stream_replay.rs in the
+   repo (multi-contract replayer with per-method scoreboards).
