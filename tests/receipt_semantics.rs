@@ -291,3 +291,102 @@ fn unknown_account_receipt_fails_receipt_not_parent() {
         out.error
     );
 }
+
+#[test]
+fn deferred_receipts_freeze_the_incident_then_settle_recovers() {
+    let wasm = build();
+    let chain = MockChain::builder()
+        .contract_bytes(CASINO, wasm)
+        .signer("player.test.near")
+        .now(1_788_000_000)
+        .build()
+        .expect("build chain");
+
+    // ── ACT 1: the incident. Entry commits; receipts hang in the queue. ──
+    let out = chain
+        .call(CASINO, "close_round")
+        .args("{}")
+        .fire_deferred()
+        .expect("fire_deferred");
+    assert!(out.ok, "entry receipt committed");
+
+    // the ON-CHAIN stuck state: round = Rolling, MPC silent, NO recovery
+    assert_eq!(
+        chain.storage_get(CASINO, b"round").as_deref(),
+        Some(b"Rolling" as &[u8]),
+        "round stuck in Rolling"
+    );
+    assert!(
+        chain.storage_get(CASINO, b"recovery").is_none(),
+        "recovery must NOT have run — MPC receipt undelivered"
+    );
+    assert!(
+        chain.storage_get(CASINO, b"last_result").is_none(),
+        "callback must NOT have run yet"
+    );
+    assert_eq!(
+        chain.pending_receipts(),
+        2,
+        "two receipts queued: MPC request + on_result callback"
+    );
+
+    // time passes on a stuck round — the incident, frozen and inspectable
+    chain.advance(600);
+
+    // ── ACT 2: the delivery. Receipts settle in causal order. ──
+    let report = chain.settle().expect("settle");
+    assert_eq!(report.delivered, 2, "both receipts delivered");
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|f| f.contains("AccountDoesNotExist")),
+        "MPC receipt failed: {:?}",
+        report.failures
+    );
+    // recovery ran AFTER the failure — the path that was untestable
+    assert_eq!(
+        chain.storage_get(CASINO, b"recovery").as_deref(),
+        Some(b"refunded" as &[u8]),
+        "recovery handler ran at settle time"
+    );
+    assert_eq!(
+        chain.storage_get(CASINO, b"last_result").as_deref(),
+        Some(b"0" as &[u8]),
+        "callback read Failed (ABI 0)"
+    );
+    // the queue drained
+    assert_eq!(chain.pending_receipts(), 0);
+}
+
+#[test]
+fn deferred_receipts_survive_intervening_transactions() {
+    // chain property: queued receipts execute against CURRENT state —
+    // transactions fired between defer and settle land first.
+    let wasm = build();
+    let chain = MockChain::builder()
+        .contract_bytes(CASINO, wasm)
+        .signer("player.test.near")
+        .now(1_788_000_000)
+        .build()
+        .expect("build chain");
+
+    chain
+        .call(CASINO, "close_round")
+        .args("{}")
+        .fire_deferred()
+        .expect("fire_deferred");
+    assert_eq!(chain.pending_receipts(), 2);
+
+    // an unrelated tx executes while the MPC receipt hangs
+    let out = chain.call(CASINO, "close_round").args("{}").fire().expect("fire");
+    assert!(out.ok);
+
+    // the queue survived the intervening tx and settles against new state
+    let report = chain.settle().expect("settle");
+    assert_eq!(report.delivered, 2);
+    assert_eq!(
+        chain.storage_get(CASINO, b"recovery").as_deref(),
+        Some(b"refunded" as &[u8])
+    );
+}

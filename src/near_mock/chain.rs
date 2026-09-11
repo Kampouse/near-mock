@@ -280,6 +280,17 @@ impl MockChain {
         advance_time(secs);
     }
 
+    /// Deliver queued receipts (see `fire_deferred`) in causal order, each
+    /// atomically, against CURRENT state. Returns per-receipt results.
+    pub fn settle(&self) -> Result<crate::near_mock::SettleReport, Box<dyn std::error::Error>> {
+        crate::near_mock::settle_receipts()
+    }
+
+    /// Receipts queued by fire_deferred() and not yet settled.
+    pub fn pending_receipts(&self) -> usize {
+        crate::near_mock::pending_receipt_count()
+    }
+
     /// Persist current storage to `state_path`. Returns the key count.
     pub fn save(&self) -> Result<usize, Box<dyn std::error::Error>> {
         let path = self
@@ -350,6 +361,16 @@ impl CallBuilder {
     pub fn fail_receipt(mut self, idx: usize) -> Self {
         self.fail_receipts.push(idx);
         self
+    }
+
+    /// Execute the call but DEFER cross-contract receipts: the entry
+    /// commits and its receipts queue for later `settle()` delivery —
+    /// the chain's async-receipt model. Between fire and settle the
+    /// intermediate state is observable (incident forensics: "round
+    /// stuck in Rolling while MPC is silent").
+    pub fn fire_deferred(self) -> Result<CallOutcome, Box<dyn std::error::Error>> {
+        crate::near_mock::set_defer_receipts(true);
+        self.fire()
     }
 
     /// Execute the call.

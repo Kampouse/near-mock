@@ -649,8 +649,22 @@ pub(crate) fn execute_tx(
                     }
                 }
             }
+            // Deferred mode: commit the entry, queue the receipts, DON'T
+            // execute — settle() delivers them later against current state.
+            // The entry-level outcome is returned; the tx-final status
+            // (final receipt) resolves at settle time.
+            let deferred = DEFER_RECEIPTS.with(|d| d.replace(false));
+            if deferred {
+                let batches: Vec<PromiseBatch> =
+                    PROMISE_DAG.with(|d| std::mem::take(&mut *d.borrow_mut()));
+                RECEIPT_QUEUE.with(|q| {
+                    q.borrow_mut().extend(batches);
+                });
+                PENDING_RETURN.with(|p| *p.borrow_mut() = None);
+            }
             // Resolve the promise DAG returned by the entry.
-            if let Some(idx) = pending {
+            if !deferred && pending.is_some() {
+                let idx = pending.unwrap();
                 match execute_promise(idx) {
                     Err(e) => {
                         outcome.ok = false;
@@ -686,8 +700,9 @@ pub(crate) fn execute_tx(
             }
             // Fire-and-forget receipts (2026-09-02): batches created but not
             // part of any returned DAG still execute as independent receipts;
-            // their failures do NOT roll back the parent tx.
-            loop {
+            // their failures do NOT roll back the parent tx. (Skipped in
+            // deferred mode — everything is queued.)
+            while !deferred {
                 let next = PROMISE_DAG.with(|d| {
                     d.borrow()
                         .iter()
@@ -755,7 +770,10 @@ fn extract_panic(raw: &str) -> Option<String> {
         ("integer divide by zero", "WasmTrap: IntegerDivisionByZero"),
         ("integer overflow", "WasmTrap: IntegerOverflow"),
         ("indirect call to null", "WasmTrap: IndirectCallToNull"),
-        ("signature mismatch", "WasmTrap: IncorrectCallIndirectSignature"),
+        (
+            "signature mismatch",
+            "WasmTrap: IncorrectCallIndirectSignature",
+        ),
         ("unreachable", "WasmTrap: Unreachable"),
         ("call stack exhausted", "WasmTrap: StackOverflow"),
     ] {
@@ -2219,6 +2237,112 @@ pub(crate) fn run_scenario(path: &str) -> Result<(), Box<dyn std::error::Error>>
 // Writes/deletes land locally; tombstones keep deletions from
 // resurrecting on later reads.
 // ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// Deferred receipts: fire_deferred() commits the entry and leaves the
+// promise DAG as a QUEUE (chain model: receipts are delivered in later
+// blocks). settle() delivers them in causal order, each atomically.
+// Between the two, the "stuck" intermediate state is observable — the
+// incident-forensics primitive (round stuck in Rolling, MPC silent).
+// ═══════════════════════════════════════════════════════════════════
+
+thread_local! {
+    /// Receipts queued by fire_deferred(), awaiting settle(). Survives
+    /// across fire() calls (chain: receipts execute against CURRENT state).
+    static RECEIPT_QUEUE: std::cell::RefCell<Vec<PromiseBatch>> =
+        std::cell::RefCell::new(Vec::new());
+    /// One-shot: fire_deferred() sets it; execute_tx consumes it.
+    static DEFER_RECEIPTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_defer_receipts(v: bool) {
+    DEFER_RECEIPTS.with(|d| d.set(v));
+}
+
+pub(crate) fn pending_receipt_count() -> usize {
+    RECEIPT_QUEUE.with(|q| q.borrow().len())
+}
+
+/// Deliver queued receipts (from fire_deferred) in causal order, each
+/// atomically (partition rollback on trap; Failed flows to dependents).
+/// Mirrors on-chain delivery: receipts execute against CURRENT state,
+/// possibly after further transactions have fired.
+pub(crate) fn settle_receipts() -> Result<SettleReport, Box<dyn std::error::Error>> {
+    let mut report = SettleReport::default();
+    let queue: Vec<PromiseBatch> = RECEIPT_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    if queue.is_empty() {
+        return Ok(report);
+    }
+
+    // fresh execution context for the delivery round (memo/dag/marks),
+    // then re-insert the batches with remapped dep indices.
+    PROMISE_DAG.with(|d| d.borrow_mut().clear());
+    EXECUTED_PROMISES.with(|e| e.borrow_mut().clear());
+    PROMISE_OUTCOMES.with(|o| o.borrow_mut().clear());
+    crate::near_mock::promises::receipt_traps_reset();
+    LOG_LINES.with(|l| l.borrow_mut().clear());
+
+    let mut remap: Vec<usize> = Vec::with_capacity(queue.len());
+    PROMISE_DAG.with(|d| {
+        let mut dag = d.borrow_mut();
+        for batch in queue {
+            let new_idx = dag.len();
+            let batch = PromiseBatch {
+                deps: batch.deps.iter().map(|dep| remap[*dep]).collect(),
+                ..batch
+            };
+            remap.push(new_idx); // queue order preserved → old idx ↦ new idx
+            dag.push(batch);
+        }
+    });
+
+    // deliver in causal order: a batch is ready when all deps executed
+    loop {
+        let next = PROMISE_DAG.with(|d| {
+            d.borrow()
+                .iter()
+                .enumerate()
+                .find(|(i, b)| {
+                    !EXECUTED_PROMISES.with(|e| e.borrow().contains(i))
+                        && b.deps.iter().all(|dep| {
+                            EXECUTED_PROMISES.with(|e| e.borrow().contains(dep))
+                        })
+                })
+                .map(|(i, _)| i)
+        });
+        let Some(idx) = next else { break };
+        match execute_promise(idx) {
+            Ok(results) => {
+                report.delivered += 1;
+                report.receipt_results.extend(results);
+            }
+            Err(_) => {
+                // infra-level failure of one receipt: count and continue
+                // (chain: a broken receipt doesn't stop other deliveries)
+                report.delivered += 1;
+                report.receipt_results.push(None);
+            }
+        }
+    }
+
+    report.failures = crate::near_mock::promises::receipt_traps_drain();
+    report.logs = LOG_LINES.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    Ok(report)
+}
+
+
+/// Result of settle(): receipts delivered in causal order.
+#[derive(Debug, Default)]
+pub struct SettleReport {
+    /// Batches delivered.
+    pub delivered: usize,
+    /// Per-batch results in delivery order (None = that receipt failed).
+    pub receipt_results: Vec<Option<Vec<u8>>>,
+    /// Failure reasons (panics, AccountDoesNotExist) across deliveries.
+    pub failures: Vec<String>,
+    /// Logs emitted by settled receipts.
+    pub logs: Vec<String>,
+}
 
 thread_local! {
     /// Prefixed keys known absent on the fork (fetched-miss or deleted

@@ -213,3 +213,20 @@ Receipts are independent atomic units (like the chain):
   NotReady — recovery handlers never fired)
 - bare wasm traps classify into nearcore's WasmTrap taxonomy (message-less
   release builds still compare by failure class)
+
+## 0.5.0 — deferred receipts: the async chain model, on demand
+
+```rust
+let out = chain.call(casino, "close_round").fire_deferred()?;  // entry commits,
+// receipts QUEUE — the stuck state is observable for as long as you like
+chain.advance(600);                                            // let it hang
+let report = chain.settle()?;                                  // deliver in causal
+// order — callbacks run, recovery paths execute, failures propagate
+```
+
+fire() still auto-drains (sync, backwards compatible). fire_deferred() is
+the chain's actual model: receipts are independent units delivered in
+later blocks. Incident forensics — "round stuck in Rolling while MPC is
+silent" — is now a deterministic two-act script you can freeze, inspect,
+time-travel, and resolve. Queued receipts survive intervening
+transactions and settle against current state, exactly like the chain.
