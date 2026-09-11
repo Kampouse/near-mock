@@ -230,3 +230,12 @@ later blocks. Incident forensics — "round stuck in Rolling while MPC is
 silent" — is now a deterministic two-act script you can freeze, inspect,
 time-travel, and resolve. Queued receipts survive intervening
 transactions and settle against current state, exactly like the chain.
+
+## 0.6.0 — strict promise hosts (nearcore parity)
+
+Promise host functions now TRAP on out-of-bounds memory reads with
+MemoryAccessViolation — matching nearcore. Previously they silently
+returned empty strings, which masked compiler bugs that produced
+corrupted string pointers: contracts verified in near-mock would
+silently no-op on-chain (lisp-rlm callAwait double-eval, 2026-09-11).
+Now the mock traps at the same point the chain would.
