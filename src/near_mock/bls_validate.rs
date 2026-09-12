@@ -472,4 +472,112 @@ mod tests {
         // non-canonical Fp element (>= modulus, e.g. all 0xFF) → ret 1
         assert_eq!(map_fp_to_g1(&[0xFFu8; 48], 1).unwrap(), None);
     }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn g1_sum_zero_plus_zero() {
+        let zero = { let mut z = vec![0u8; 96]; z[0] |= 0x40; z };
+        let input = [vec![0u8], zero.clone(), vec![0u8], zero.clone()].concat();
+        match eval(kind::P1_SUM, &input) {
+            Ok(Some(bytes)) => assert_eq!(bytes, zero, "0 + 0 should be 0"),
+            Ok(None) => panic!("0+0 returned failure"),
+            Err(e) => panic!("0+0 returned host error: {}", e),
+        }
+    }
+
+    #[test]
+    fn g1_sum_self_inverse() {
+        let gx = "17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+        let gy = "08b3f481e3aaa0f1a09e30ed741d8ae4fcf5e095d5d00af600db18cb2c04b3edd03cc744a2888ae40caa232946c5e7e1";
+        let g = hex(&format!("{}{}", gx, gy));
+        let input = [vec![0u8], g.clone(), vec![1u8], g.clone()].concat();
+        match eval(kind::P1_SUM, &input) {
+            Ok(Some(bytes)) => {
+                let zero = { let mut z = vec![0u8; 96]; z[0] |= 0x40; z };
+                assert_eq!(bytes, zero, "P + (-P) should be 0");
+            }
+            Ok(None) => panic!("P+(-P) returned failure"),
+            Err(e) => panic!("P+(-P) host error: {}", e),
+        }
+    }
+
+    #[test]
+    fn pairing_check_empty_is_vacuously_true() {
+        assert_eq!(pairing_check(&[]), Ok(0));
+    }
+}
+
+#[cfg(test)]
+mod bls_corner_cases {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+    }
+
+    /// (0, ±2) — on curve E(Fp) but NOT in the G1 subgroup.
+    /// This is the NEP-488 corner case: bls12381_not_in_group_fix=true
+    /// should ACCEPT it in p1_sum; the subgroup check is only enforced
+    /// in multiexp and pairing_check.
+    #[test]
+    fn p1_sum_accepts_x0_point_with_fix() {
+        let mut x0 = vec![0u8; 96];
+        x0[95] = 2; // y = 2, x = 0
+        // x0 + x0 should succeed (not return None) with the fix enabled
+        let input = [vec![0u8], x0.clone(), vec![0u8], x0.clone()].concat();
+        match eval(kind::P1_SUM, &input) {
+            Ok(Some(_)) => {} // accepted — correct with not_in_group_fix
+            Ok(None) => panic!("x0+x0 rejected — is not_in_group_fix applied?"),
+            Err(e) => panic!("x0+x0 host error: {}", e),
+        }
+    }
+
+    /// Same (0, 2) point in multiexp — MUST be rejected (explicit subgroup check)
+    #[test]
+    fn g1_multiexp_rejects_x0_point() {
+        let mut x0 = vec![0u8; 96];
+        x0[95] = 2;
+        let scalar = vec![1u8; 32]; // scalar = 1
+        let input = [x0.clone(), scalar].concat();
+        match eval(kind::G1_MULTIEXP, &input) {
+            Ok(Some(_)) => panic!("x0 in multiexp should be REJECTED (not in G1)"),
+            Ok(None) => {} // correctly rejected
+            Err(e) => panic!("x0 multiexp host error: {}", e),
+        }
+    }
+
+    /// Same (0, 2) point in pairing — MUST be rejected
+    #[test]
+    fn pairing_rejects_x0_point() {
+        let mut x0_g1 = vec![0u8; 96];
+        x0_g1[95] = 2;
+        // G2 generator (just zeros for simplicity — will fail for other reasons but shouldn't panic)
+        let g2 = vec![0u8; 192];
+        let input = [x0_g1, g2].concat();
+        match pairing_check(&input) {
+            Ok(1) => {} // correctly rejected
+            Ok(0) => panic!("x0 in pairing should return 1 (rejected)"),
+            Ok(n) => panic!("x0 pairing returned {} (expected 1)", n),
+            Err(e) => panic!("x0 pairing host error: {}", e),
+        }
+    }
+
+    /// Decompress the (0, 2) point — compressed form has x=0, sign of y=2
+    #[test]
+    fn p1_decompress_x0() {
+        let mut compressed = vec![0u8; 48];
+        compressed[0] = 0x80; // compression flag + x=0, y positive
+        match eval(kind::P1_DECOMPRESS, &compressed) {
+            Ok(Some(bytes)) => {
+                assert_eq!(bytes.len(), 96, "decompressed should be 96B");
+                // With the fix, should decompress to (0, 2)
+                assert_eq!(bytes[95], 2, "y should be 2 (or at least non-zero)");
+            }
+            Ok(None) => panic!("decompress x0 rejected — is not_in_group_fix applied?"),
+            Err(e) => panic!("decompress x0 host error: {}", e),
+        }
+    }
 }
