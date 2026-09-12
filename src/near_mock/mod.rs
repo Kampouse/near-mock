@@ -105,6 +105,11 @@ pub(crate) fn compile_module(
     bytes: &[u8],
 ) -> Result<wasmtime::Module, Box<dyn std::error::Error>> {
     let prepared = instrument::instrument(bytes)?;
+    // Debug aid: dump the instrumented wasm so trap offsets from wasmtime
+    // backtraces can be disassembled (NEAR_MOCK_DUMP_INSTRUMENTED=path).
+    if let Ok(path) = std::env::var("NEAR_MOCK_DUMP_INSTRUMENTED") {
+        let _ = std::fs::write(&path, &prepared);
+    }
     Ok(wasmtime::Module::from_binary(engine, &prepared)?)
 }
 pub(crate) use promises::{
@@ -618,8 +623,14 @@ pub(crate) fn execute_tx(
     };
     if result.is_err() {
         outcome.entry_trapped = true;
-        outcome.error = Some(result.as_ref().err().unwrap().to_string());
-        outcome.panic = extract_panic(&error_chain(result.as_ref().err().unwrap()));
+        // Full error chain, not just the top-level Display: wasmtime's
+        // Display is the backtrace ("error while executing at wasm
+        // backtrace: 0: …") and HIDES the root host error (e.g.
+        // "BLS12381InvalidInput: …", "ProhibitedInView …") one+ levels
+        // deep in the chain. Cross-mode consumers (print_outcome, --json,
+        // the differ, test assertions on trap flavor) must see the cause.
+        outcome.error = Some(error_chain(result.as_ref().err().unwrap()));
+        outcome.panic = extract_panic(&outcome.error.clone().unwrap());
         // entry failed: snapshot WITHOUT the attach credit → full refund
         if attach > 0 {
             let key = prefixed_key(contract_acct, b"\x00near-bal");
@@ -1192,7 +1203,12 @@ fn build_promise_hosts(
                 crate::near_mock::READ_MEMORY_BASE_GAS
                     + crate::near_mock::READ_MEMORY_BYTE_GAS * acct_len,
             )?;
-let acct = mem_read_str_checked(&mut caller, args[0].unwrap_i64(), args[1].unwrap_i64(), "promise-host")?;
+            let acct = mem_read_str_checked(
+                &mut caller,
+                args[0].unwrap_i64(),
+                args[1].unwrap_i64(),
+                "promise-host",
+            )?;
             mtrace!("  → promise_batch_create({}) [dag]", acct);
             results[0] = Val::I64(dag_push(vec![], acct, vec![]) as i64);
             Ok(())
@@ -1205,7 +1221,12 @@ let acct = mem_read_str_checked(&mut caller, args[0].unwrap_i64(), args[1].unwra
         FuncType::new(engine, vec![ValType::I64; 3], vec![ValType::I64]),
         move |mut caller, args, results| {
             let idx = args[0].unwrap_i64() as usize;
-let acct = mem_read_str_checked(&mut caller, args[1].unwrap_i64(), args[2].unwrap_i64(), "promise-host")?;
+            let acct = mem_read_str_checked(
+                &mut caller,
+                args[1].unwrap_i64(),
+                args[2].unwrap_i64(),
+                "promise-host",
+            )?;
             results[0] = Val::I64(dag_push(vec![idx], acct, vec![]) as i64);
             Ok(())
         },
@@ -1217,8 +1238,18 @@ let acct = mem_read_str_checked(&mut caller, args[1].unwrap_i64(), args[2].unwra
         FuncType::new(engine, vec![ValType::I64; 7], vec![]),
         move |mut caller, args, _| {
             let idx = args[0].unwrap_i64() as usize;
-let method = mem_read_str_checked(&mut caller, args[1].unwrap_i64(), args[2].unwrap_i64(), "promise-host")?;
-let args_json = mem_read_str_checked(&mut caller, args[3].unwrap_i64(), args[4].unwrap_i64(), "promise-host")?;
+            let method = mem_read_str_checked(
+                &mut caller,
+                args[1].unwrap_i64(),
+                args[2].unwrap_i64(),
+                "promise-host",
+            )?;
+            let args_json = mem_read_str_checked(
+                &mut caller,
+                args[3].unwrap_i64(),
+                args[4].unwrap_i64(),
+                "promise-host",
+            )?;
             let gas = args[6].unwrap_i64() as u64;
             let dep = {
                 let ptr = args[5].unwrap_i64() as usize;
@@ -1286,8 +1317,18 @@ let args_json = mem_read_str_checked(&mut caller, args[3].unwrap_i64(), args[4].
         &mut *store,
         FuncType::new(engine, vec![ValType::I64; 7], vec![ValType::I64]),
         move |mut caller, args, results| {
-let method = mem_read_str_checked(&mut caller, args[0].unwrap_i64(), args[1].unwrap_i64(), "promise-host")?;
-let args_json = mem_read_str_checked(&mut caller, args[2].unwrap_i64(), args[3].unwrap_i64(), "promise-host")?;
+            let method = mem_read_str_checked(
+                &mut caller,
+                args[0].unwrap_i64(),
+                args[1].unwrap_i64(),
+                "promise-host",
+            )?;
+            let args_json = mem_read_str_checked(
+                &mut caller,
+                args[2].unwrap_i64(),
+                args[3].unwrap_i64(),
+                "promise-host",
+            )?;
             let reg = args[6].unwrap_i64() as u64;
             let contract = exec_ctx_or_default().contract;
             mtrace!(
@@ -1344,8 +1385,18 @@ let args_json = mem_read_str_checked(&mut caller, args[2].unwrap_i64(), args[3].
         move |mut caller, args, results| {
             // ABI: (data_id_len, data_id_ptr, payload_len, payload_ptr) — the
             // emitter passes the data_id as a STRING ("yd:<idx>" or "<idx>")
-let data_id = mem_read_str_checked(&mut caller, args[0].unwrap_i64(), args[1].unwrap_i64(), "promise-host")?;
-let payload = mem_read_str_checked(&mut caller, args[2].unwrap_i64(), args[3].unwrap_i64(), "promise-host")?;
+            let data_id = mem_read_str_checked(
+                &mut caller,
+                args[0].unwrap_i64(),
+                args[1].unwrap_i64(),
+                "promise-host",
+            )?;
+            let payload = mem_read_str_checked(
+                &mut caller,
+                args[2].unwrap_i64(),
+                args[3].unwrap_i64(),
+                "promise-host",
+            )?;
             let idx: usize = data_id
                 .trim_start_matches("yd:")
                 .parse()
@@ -1438,9 +1489,24 @@ let payload = mem_read_str_checked(&mut caller, args[2].unwrap_i64(), args[3].un
         &mut *store,
         FuncType::new(engine, vec![ValType::I64; 8], vec![ValType::I64]),
         move |mut caller, args, results| {
-let acct = mem_read_str_checked(&mut caller, args[0].unwrap_i64(), args[1].unwrap_i64(), "promise-host")?;
-let method = mem_read_str_checked(&mut caller, args[2].unwrap_i64(), args[3].unwrap_i64(), "promise-host")?;
-let args_json = mem_read_str_checked(&mut caller, args[4].unwrap_i64(), args[5].unwrap_i64(), "promise-host")?;
+            let acct = mem_read_str_checked(
+                &mut caller,
+                args[0].unwrap_i64(),
+                args[1].unwrap_i64(),
+                "promise-host",
+            )?;
+            let method = mem_read_str_checked(
+                &mut caller,
+                args[2].unwrap_i64(),
+                args[3].unwrap_i64(),
+                "promise-host",
+            )?;
+            let args_json = mem_read_str_checked(
+                &mut caller,
+                args[4].unwrap_i64(),
+                args[5].unwrap_i64(),
+                "promise-host",
+            )?;
             let idx = dag_push(
                 vec![],
                 acct,
@@ -1462,9 +1528,24 @@ let args_json = mem_read_str_checked(&mut caller, args[4].unwrap_i64(), args[5].
         FuncType::new(engine, vec![ValType::I64; 9], vec![ValType::I64]),
         move |mut caller, args, results| {
             let idx = args[0].unwrap_i64() as usize;
-let acct = mem_read_str_checked(&mut caller, args[1].unwrap_i64(), args[2].unwrap_i64(), "promise-host")?;
-let method = mem_read_str_checked(&mut caller, args[3].unwrap_i64(), args[4].unwrap_i64(), "promise-host")?;
-let args_json = mem_read_str_checked(&mut caller, args[5].unwrap_i64(), args[6].unwrap_i64(), "promise-host")?;
+            let acct = mem_read_str_checked(
+                &mut caller,
+                args[1].unwrap_i64(),
+                args[2].unwrap_i64(),
+                "promise-host",
+            )?;
+            let method = mem_read_str_checked(
+                &mut caller,
+                args[3].unwrap_i64(),
+                args[4].unwrap_i64(),
+                "promise-host",
+            )?;
+            let args_json = mem_read_str_checked(
+                &mut caller,
+                args[5].unwrap_i64(),
+                args[6].unwrap_i64(),
+                "promise-host",
+            )?;
             let new_idx = dag_push(
                 vec![idx],
                 acct,
@@ -2308,9 +2389,9 @@ pub(crate) fn settle_receipts() -> Result<SettleReport, Box<dyn std::error::Erro
                 .enumerate()
                 .find(|(i, b)| {
                     !EXECUTED_PROMISES.with(|e| e.borrow().contains(i))
-                        && b.deps.iter().all(|dep| {
-                            EXECUTED_PROMISES.with(|e| e.borrow().contains(dep))
-                        })
+                        && b.deps
+                            .iter()
+                            .all(|dep| EXECUTED_PROMISES.with(|e| e.borrow().contains(dep)))
                 })
                 .map(|(i, _)| i)
         });
@@ -2333,7 +2414,6 @@ pub(crate) fn settle_receipts() -> Result<SettleReport, Box<dyn std::error::Erro
     report.logs = LOG_LINES.with(|l| std::mem::take(&mut *l.borrow_mut()));
     Ok(report)
 }
-
 
 /// Result of settle(): receipts delivered in causal order.
 #[derive(Debug, Default)]
